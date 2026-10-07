@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 #include <utility>
@@ -38,16 +39,26 @@ inline uint32_t PpcStorePsqFloatBitsInline(uint32_t value)
 
 inline uint64_t PpcLoadPairPsqFloatBitsPackedInline(uint64_t value)
 {
+#if defined(__x86_64__)
     const __m128i lanes = _mm_cvtsi64_si128(static_cast<long long>(value));
     const __m128i magnitude = _mm_and_si128(lanes, _mm_set1_epi32(0x7FFFFFFF));
     const __m128i nanMask = _mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x7F800000));
     const __m128i result = _mm_or_si128(
         lanes, _mm_and_si128(nanMask, _mm_set1_epi32(0x00400000)));
     return static_cast<uint64_t>(_mm_cvtsi128_si64(result));
+#elif defined(__aarch64__)
+    // Equivalent to applying PpcLoadPsqFloatBitsInline to each 32-bit lane: the
+    // x86 body above only ever acts on these same two lanes (the upper 64 bits
+    // _mm_cvtsi64_si128 zero-fills never survive the final truncating extract).
+    const uint32_t lo = PpcLoadPsqFloatBitsInline(static_cast<uint32_t>(value));
+    const uint32_t hi = PpcLoadPsqFloatBitsInline(static_cast<uint32_t>(value >> 32));
+    return (static_cast<uint64_t>(hi) << 32) | lo;
+#endif
 }
 
 inline uint64_t PpcStorePairPsqFloatBitsPackedInline(uint64_t value)
 {
+#if defined(__x86_64__)
     const __m128i lanes = _mm_cvtsi64_si128(static_cast<long long>(value));
     const __m128i magnitude = _mm_and_si128(lanes, _mm_set1_epi32(0x7FFFFFFF));
     const __m128i subnormalMask = _mm_cmplt_epi32(magnitude, _mm_set1_epi32(0x00800000));
@@ -60,8 +71,16 @@ inline uint64_t PpcStorePairPsqFloatBitsPackedInline(uint64_t value)
         _mm_and_si128(subnormalMask, signedZero),
         _mm_andnot_si128(subnormalMask, quieted));
     return static_cast<uint64_t>(_mm_cvtsi128_si64(result));
+#elif defined(__aarch64__)
+    // Equivalent to applying PpcStorePsqFloatBitsInline to each 32-bit lane;
+    // same reasoning as the load-side port above.
+    const uint32_t lo = PpcStorePsqFloatBitsInline(static_cast<uint32_t>(value));
+    const uint32_t hi = PpcStorePsqFloatBitsInline(static_cast<uint32_t>(value >> 32));
+    return (static_cast<uint64_t>(hi) << 32) | lo;
+#endif
 }
 
+#if defined(__x86_64__)
 inline __m128i PpcPsqSwapPairBytesInline(__m128i lanes)
 {
     const __m128i order = _mm_setr_epi8(
@@ -95,21 +114,42 @@ inline __m128i PpcStorePairPsqFloatBitsLanesInline(__m128i lanes)
         _mm_and_si128(subnormalMask, signedZero),
         _mm_andnot_si128(subnormalMask, quieted));
 }
+#endif // defined(__x86_64__)
 
 // host -> packed FPR double, guard already proven by the caller.
 inline double PpcLoadPairPsqFloatFromHostInline(const uint8_t* host)
 {
+#if defined(__x86_64__)
     const __m128i raw = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(host));
     return PpcM128ToPsInline(_mm_castsi128_ps(
         PpcLoadPairPsqFloatBitsLanesInline(PpcPsqSwapPairBytesInline(raw))));
+#elif defined(__aarch64__)
+    // The x86 path's full 8-byte pshufb reversal plus a same-endian load is,
+    // taken together, exactly a 64-bit byteswap of a plain little-endian load:
+    // it turns the on-disk [ps0 big-endian][ps1 big-endian] byte layout into a
+    // native uint64 with low 32 bits = ps1, high 32 bits = ps0 (this file's
+    // documented packed-double lane convention).
+    uint64_t raw = 0;
+    std::memcpy(&raw, host, sizeof(raw));
+    const uint64_t swapped = __builtin_bswap64(raw);
+    return PpcBitCastToDoubleInline(PpcLoadPairPsqFloatBitsPackedInline(swapped));
+#endif
 }
 
 // packed FPR double -> host, guard already proven by the caller.
 inline void PpcStorePairPsqFloatToHostInline(uint8_t* host, double value)
 {
+#if defined(__x86_64__)
     const __m128i lanes = PpcStorePairPsqFloatBitsLanesInline(
         _mm_castps_si128(PpcPsToM128Inline(value)));
     _mm_storel_epi64(reinterpret_cast<__m128i*>(host), PpcPsqSwapPairBytesInline(lanes));
+#elif defined(__aarch64__)
+    // Inverse of the load path above: bswap64 is its own inverse, so applying
+    // it to the quieted packed value reproduces the on-disk big-endian bytes.
+    const uint64_t quieted = PpcStorePairPsqFloatBitsPackedInline(PpcBitCastToU64Inline(value));
+    const uint64_t swapped = __builtin_bswap64(quieted);
+    std::memcpy(host, &swapped, sizeof(swapped));
+#endif
 }
 
 template <typename SignedType>
@@ -224,6 +264,8 @@ inline void PpcWritePairPsqInline(uint32_t addr, T first, T second)
 // reading stale bytes, and unmapped pages commit on demand, same as MemoryInline::Flat* loads.
 MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr)
 {
+    if (GuestFlat::RequiresCheckedAccess()) [[unlikely]]
+        return nullptr;
     return MKW_FLAT_GUEST_BASE + addr;
 }
 
@@ -234,6 +276,8 @@ MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr
 // executable, and unmapped pages still trap.
 MKW_PPC_FORCE_INLINE uint8_t* PpcTryGetPsqWritableHostInline(uint32_t addr)
 {
+    if (GuestFlat::RequiresCheckedAccess()) [[unlikely]]
+        return nullptr;
     if (addr > UINT32_MAX - 7u) [[unlikely]]
         return nullptr;
     if (MemoryInline::FlatWriteNeedsPolicy(addr) ||
@@ -250,7 +294,7 @@ inline double PpcLoadPairPsqFloatFastInline(uint32_t addr)
         return PpcLoadPairPsqFloatFromHostInline(host);
     }
     return PpcBitCastToDoubleInline(
-        PpcLoadPairPsqFloatBitsPackedInline(MemoryInline::Read64Slow(addr)));
+        PpcLoadPairPsqFloatBitsPackedInline(Memory::Read64(addr)));
 }
 
 inline double PpcLoadSinglePsqFloatFastInline(uint32_t addr)
@@ -305,7 +349,7 @@ inline void PpcStorePairPsqFloatFastInline(uint32_t addr, double value)
         PpcStorePairPsqFloatToHostInline(host, value);
         return;
     }
-    MemoryInline::Write64Slow(
+    Memory::Write64(
         addr, PpcStorePairPsqFloatBitsPackedInline(PpcBitCastToU64Inline(value)));
 }
 
@@ -329,6 +373,7 @@ inline uint8_t PpcQuantizePsqU8Scale61Inline(float value)
 // matching PpcQuantizePsqU8Scale61Inline's !(scaled > 0) rule.
 inline uint16_t PpcQuantizePairPsqU8Scale61PackedInline(double value)
 {
+#if defined(__x86_64__)
     const __m128 scaled = _mm_mul_ps(PpcPsToM128Inline(value), _mm_set1_ps(0.125f));
     const __m128 nonNegative = _mm_max_ps(scaled, _mm_setzero_ps());
     const __m128 clamped = _mm_min_ps(nonNegative, _mm_set1_ps(255.0f));
@@ -338,6 +383,17 @@ inline uint16_t PpcQuantizePairPsqU8Scale61PackedInline(double value)
     // Native lane 0 is ps1 and lane 1 is ps0. Packing to the low uint16_t
     // therefore produces the guest-order numeric value (ps0 << 8) | ps1.
     return static_cast<uint16_t>(_mm_cvtsi128_si32(lanes8));
+#elif defined(__aarch64__)
+    // Equivalent to two calls of the already-portable scalar quantizer above
+    // (its own !(scaled > 0) rule maps NaN to 0, matching what MAXPS-with-zero
+    // does on the x86 path per the comment there), packed the same way the
+    // fallback path just below already does for the non-SIMD case.
+    PPC_FPR fpr{};
+    fpr.d = value;
+    const uint8_t q0 = PpcQuantizePsqU8Scale61Inline(fpr.paired.ps0);
+    const uint8_t q1 = PpcQuantizePsqU8Scale61Inline(fpr.paired.ps1);
+    return static_cast<uint16_t>((static_cast<uint16_t>(q0) << 8) | static_cast<uint16_t>(q1));
+#endif
 }
 
 // Preserve the complete memory/MMIO/executable-write behavior off the leaf
@@ -1329,37 +1385,13 @@ MKW_PPC_FORCE_INLINE void PPC_PsqStStackInline(uint32_t addr, double value)
 // Context-free PSQ entries for translated regions which own GQR state as an
 // ordinary native value. All architecturally valid quantization encodings are
 // handled directly; reserved encodings retain the generic helper's abort.
-template <uint32_t W, uint32_t I, bool Stack>
-MKW_PPC_NO_INLINE MKW_PPC_COLD inline double PPC_PsqLStateFallback(uint32_t gqr, uint32_t addr)
-{
-    static_assert(W <= 1u && I < 8u);
-    const uint32_t type = (gqr >> 16) & 0x7u;
-    const uint32_t scale = (gqr >> 24) & 0x3Fu;
-    if constexpr (W == 0u)
-    {
-        switch (type)
-        {
-        case 0u: return Stack ? PpcLoadPairPsqFloatStackInline(addr) : PpcLoadPairPsqFloatFastInline(addr);
-        case 4u: return Stack ? PpcLoadPairPsqIntegerStackInline<uint8_t>(addr, scale) : PpcLoadPairPsqIntegerFastInline<uint8_t>(addr, scale);
-        case 5u: return Stack ? PpcLoadPairPsqIntegerStackInline<uint16_t>(addr, scale) : PpcLoadPairPsqIntegerFastInline<uint16_t>(addr, scale);
-        case 6u: return Stack ? PpcLoadPairPsqIntegerStackInline<int8_t>(addr, scale) : PpcLoadPairPsqIntegerFastInline<int8_t>(addr, scale);
-        case 7u: return Stack ? PpcLoadPairPsqIntegerStackInline<int16_t>(addr, scale) : PpcLoadPairPsqIntegerFastInline<int16_t>(addr, scale);
-        default: std::abort();
-        }
-    }
-    else
-    {
-        switch (type)
-        {
-        case 0u: return Stack ? PpcLoadSinglePsqFloatStackInline(addr) : PpcLoadSinglePsqFloatFastInline(addr);
-        case 4u: return Stack ? PpcLoadSinglePsqQuantizedStackInline<uint8_t>(addr, scale) : PpcLoadSinglePsqQuantizedFastInline<uint8_t>(addr, scale);
-        case 5u: return Stack ? PpcLoadSinglePsqQuantizedStackInline<uint16_t>(addr, scale) : PpcLoadSinglePsqQuantizedFastInline<uint16_t>(addr, scale);
-        case 6u: return Stack ? PpcLoadSinglePsqQuantizedStackInline<int8_t>(addr, scale) : PpcLoadSinglePsqQuantizedFastInline<int8_t>(addr, scale);
-        case 7u: return Stack ? PpcLoadSinglePsqQuantizedStackInline<int16_t>(addr, scale) : PpcLoadSinglePsqQuantizedFastInline<int16_t>(addr, scale);
-        default: std::abort();
-        }
-    }
-}
+template <uint32_t W, bool Stack>
+MKW_PPC_NO_INLINE MKW_PPC_COLD double PPC_PsqLStateFallback(uint32_t gqr, uint32_t addr);
+
+extern template double PPC_PsqLStateFallback<0u, false>(uint32_t, uint32_t);
+extern template double PPC_PsqLStateFallback<0u, true>(uint32_t, uint32_t);
+extern template double PPC_PsqLStateFallback<1u, false>(uint32_t, uint32_t);
+extern template double PPC_PsqLStateFallback<1u, true>(uint32_t, uint32_t);
 
 // Keep the normal explicit-state path small and directly optimizable. Exact
 // unscaled encodings cover the SDK's common GQR setup; scaled and reserved
@@ -1386,41 +1418,17 @@ MKW_PPC_FORCE_INLINE double PPC_PsqLStateInline(uint32_t gqr, uint32_t addr)
         if constexpr (W == 0u) return Stack ? PpcLoadPairPsqIntegerStackInline<int16_t>(addr, 0u) : PpcLoadPairPsqIntegerFastInline<int16_t>(addr, 0u);
         else return Stack ? PpcLoadSinglePsqQuantizedStackInline<int16_t>(addr, 0u) : PpcLoadSinglePsqQuantizedFastInline<int16_t>(addr, 0u);
     default:
-        return PPC_PsqLStateFallback<W, I, Stack>(gqr, addr);
+        return PPC_PsqLStateFallback<W, Stack>(gqr, addr);
     }
 }
 
-template <uint32_t W, uint32_t I, bool Stack>
-MKW_PPC_NO_INLINE MKW_PPC_COLD inline void PPC_PsqStStateFallback(uint32_t gqr, uint32_t addr, double value)
-{
-    static_assert(W <= 1u && I < 8u);
-    const uint32_t type = gqr & 0x7u;
-    const uint32_t scale = (gqr >> 8) & 0x3Fu;
-    if constexpr (W == 0u)
-    {
-        switch (type)
-        {
-        case 0u: Stack ? PpcStorePairPsqFloatStackInline(addr, value) : PpcStorePairPsqFloatFastInline(addr, value); return;
-        case 4u: if constexpr (Stack) PpcStorePairPsqQuantizedStackInline<uint8_t>(addr, value, scale); else PpcStorePairPsqQuantizedFastInline<uint8_t>(addr, value, scale); return;
-        case 5u: if constexpr (Stack) PpcStorePairPsqQuantizedStackInline<uint16_t>(addr, value, scale); else PpcStorePairPsqQuantizedFastInline<uint16_t>(addr, value, scale); return;
-        case 6u: if constexpr (Stack) PpcStorePairPsqQuantizedStackInline<int8_t>(addr, value, scale); else PpcStorePairPsqQuantizedFastInline<int8_t>(addr, value, scale); return;
-        case 7u: if constexpr (Stack) PpcStorePairPsqQuantizedStackInline<int16_t>(addr, value, scale); else PpcStorePairPsqQuantizedFastInline<int16_t>(addr, value, scale); return;
-        default: std::abort();
-        }
-    }
-    else
-    {
-        switch (type)
-        {
-        case 0u: if constexpr (Stack) PpcStoreSinglePsqFloatStackInline(addr, value); else PpcStoreSinglePsqFloatFastInline(addr, value); return;
-        case 4u: if constexpr (Stack) PpcStoreSinglePsqQuantizedStackInline<uint8_t>(addr, value, scale); else PpcStoreSinglePsqQuantizedFastInline<uint8_t>(addr, value, scale); return;
-        case 5u: if constexpr (Stack) PpcStoreSinglePsqQuantizedStackInline<uint16_t>(addr, value, scale); else PpcStoreSinglePsqQuantizedFastInline<uint16_t>(addr, value, scale); return;
-        case 6u: if constexpr (Stack) PpcStoreSinglePsqQuantizedStackInline<int8_t>(addr, value, scale); else PpcStoreSinglePsqQuantizedFastInline<int8_t>(addr, value, scale); return;
-        case 7u: if constexpr (Stack) PpcStoreSinglePsqQuantizedStackInline<int16_t>(addr, value, scale); else PpcStoreSinglePsqQuantizedFastInline<int16_t>(addr, value, scale); return;
-        default: std::abort();
-        }
-    }
-}
+template <uint32_t W, bool Stack>
+MKW_PPC_NO_INLINE MKW_PPC_COLD void PPC_PsqStStateFallback(uint32_t gqr, uint32_t addr, double value);
+
+extern template void PPC_PsqStStateFallback<0u, false>(uint32_t, uint32_t, double);
+extern template void PPC_PsqStStateFallback<0u, true>(uint32_t, uint32_t, double);
+extern template void PPC_PsqStStateFallback<1u, false>(uint32_t, uint32_t, double);
+extern template void PPC_PsqStStateFallback<1u, true>(uint32_t, uint32_t, double);
 
 template <uint32_t W, uint32_t I, bool Stack>
 MKW_PPC_FORCE_INLINE void PPC_PsqStStateInline(uint32_t gqr, uint32_t addr, double value)
@@ -1449,10 +1457,17 @@ MKW_PPC_FORCE_INLINE void PPC_PsqStStateInline(uint32_t gqr, uint32_t addr, doub
         else { if constexpr (Stack) PpcStoreSinglePsqQuantizedStackInline<int16_t>(addr, value, 0u); else PpcStoreSinglePsqQuantizedFastInline<int16_t>(addr, value, 0u); }
         return;
     default:
-        PPC_PsqStStateFallback<W, I, Stack>(gqr, addr, value);
+        PPC_PsqStStateFallback<W, Stack>(gqr, addr, value);
         return;
     }
 }
+
+template <uint32_t W>
+MKW_PPC_NO_INLINE MKW_PPC_COLD double PPC_PsqLResolvedStateFallback(
+    uint32_t gqr, uint8_t* resolvedHost, uint32_t offset, uint32_t addr);
+
+extern template double PPC_PsqLResolvedStateFallback<0u>(uint32_t, uint8_t*, uint32_t, uint32_t);
+extern template double PPC_PsqLResolvedStateFallback<1u>(uint32_t, uint8_t*, uint32_t, uint32_t);
 
 template <uint32_t W, uint32_t I>
 MKW_PPC_FORCE_INLINE double PPC_PsqLResolvedStateInline(
@@ -1461,32 +1476,40 @@ MKW_PPC_FORCE_INLINE double PPC_PsqLResolvedStateInline(
     static_assert(W <= 1u && I < 8u);
     if (!resolvedHost) [[unlikely]] return PPC_PsqLStateInline<W, I, false>(gqr, addr);
     const uint32_t type = (gqr >> 16) & 0x7u;
-    const uint32_t scale = (gqr >> 24) & 0x3Fu;
+    if (type == 0u) {
+        if constexpr (W == 0u) return PpcLoadPairPsqFloatResolvedInline(resolvedHost, offset, addr);
+        else return PpcLoadSinglePsqFloatResolvedInline(resolvedHost, offset, addr);
+    }
     if constexpr (W == 0u)
     {
-        switch (type)
+        switch (gqr & 0x3F070000u)
         {
-        case 0u: return PpcLoadPairPsqFloatResolvedInline(resolvedHost, offset, addr);
-        case 4u: return PpcLoadPairPsqIntegerResolvedInline<uint8_t>(resolvedHost, offset, addr, scale);
-        case 5u: return PpcLoadPairPsqIntegerResolvedInline<uint16_t>(resolvedHost, offset, addr, scale);
-        case 6u: return PpcLoadPairPsqIntegerResolvedInline<int8_t>(resolvedHost, offset, addr, scale);
-        case 7u: return PpcLoadPairPsqIntegerResolvedInline<int16_t>(resolvedHost, offset, addr, scale);
-        default: std::abort();
+        case 0x00040000u: return PpcLoadPairPsqIntegerResolvedInline<uint8_t>(resolvedHost, offset, addr, 0u);
+        case 0x00050000u: return PpcLoadPairPsqIntegerResolvedInline<uint16_t>(resolvedHost, offset, addr, 0u);
+        case 0x00060000u: return PpcLoadPairPsqIntegerResolvedInline<int8_t>(resolvedHost, offset, addr, 0u);
+        case 0x00070000u: return PpcLoadPairPsqIntegerResolvedInline<int16_t>(resolvedHost, offset, addr, 0u);
+        default: return PPC_PsqLResolvedStateFallback<W>(gqr, resolvedHost, offset, addr);
         }
     }
     else
     {
-        switch (type)
+        switch (gqr & 0x3F070000u)
         {
-        case 0u: return PpcLoadSinglePsqFloatResolvedInline(resolvedHost, offset, addr);
-        case 4u: return PpcLoadSinglePsqQuantizedResolvedInline<uint8_t>(resolvedHost, offset, addr, scale);
-        case 5u: return PpcLoadSinglePsqQuantizedResolvedInline<uint16_t>(resolvedHost, offset, addr, scale);
-        case 6u: return PpcLoadSinglePsqQuantizedResolvedInline<int8_t>(resolvedHost, offset, addr, scale);
-        case 7u: return PpcLoadSinglePsqQuantizedResolvedInline<int16_t>(resolvedHost, offset, addr, scale);
-        default: std::abort();
+        case 0x00040000u: return PpcLoadSinglePsqQuantizedResolvedInline<uint8_t>(resolvedHost, offset, addr, 0u);
+        case 0x00050000u: return PpcLoadSinglePsqQuantizedResolvedInline<uint16_t>(resolvedHost, offset, addr, 0u);
+        case 0x00060000u: return PpcLoadSinglePsqQuantizedResolvedInline<int8_t>(resolvedHost, offset, addr, 0u);
+        case 0x00070000u: return PpcLoadSinglePsqQuantizedResolvedInline<int16_t>(resolvedHost, offset, addr, 0u);
+        default: return PPC_PsqLResolvedStateFallback<W>(gqr, resolvedHost, offset, addr);
         }
     }
 }
+
+template <uint32_t W>
+MKW_PPC_NO_INLINE MKW_PPC_COLD void PPC_PsqStResolvedStateFallback(
+    uint32_t gqr, uint8_t* resolvedHost, uint32_t offset, uint32_t addr, double value);
+
+extern template void PPC_PsqStResolvedStateFallback<0u>(uint32_t, uint8_t*, uint32_t, uint32_t, double);
+extern template void PPC_PsqStResolvedStateFallback<1u>(uint32_t, uint8_t*, uint32_t, uint32_t, double);
 
 template <uint32_t W, uint32_t I>
 MKW_PPC_FORCE_INLINE void PPC_PsqStResolvedStateInline(
@@ -1499,29 +1522,32 @@ MKW_PPC_FORCE_INLINE void PPC_PsqStResolvedStateInline(
         return;
     }
     const uint32_t type = gqr & 0x7u;
-    const uint32_t scale = (gqr >> 8) & 0x3Fu;
+    if (type == 0u) {
+        if constexpr (W == 0u) PpcStorePairPsqFloatResolvedInline(resolvedHost, offset, addr, value);
+        else PpcStoreSinglePsqFloatResolvedInline(resolvedHost, offset, addr, value);
+        return;
+    }
     if constexpr (W == 0u)
     {
-        switch (type)
+        switch (gqr & 0x3F07u)
         {
-        case 0u: PpcStorePairPsqFloatResolvedInline(resolvedHost, offset, addr, value); return;
-        case 4u: PpcStorePairPsqQuantizedResolvedInline<uint8_t>(resolvedHost, offset, addr, value, scale); return;
-        case 5u: PpcStorePairPsqQuantizedResolvedInline<uint16_t>(resolvedHost, offset, addr, value, scale); return;
-        case 6u: PpcStorePairPsqQuantizedResolvedInline<int8_t>(resolvedHost, offset, addr, value, scale); return;
-        case 7u: PpcStorePairPsqQuantizedResolvedInline<int16_t>(resolvedHost, offset, addr, value, scale); return;
-        default: std::abort();
+        case 0x3D04u: PpcStorePairPsqU8Scale61ResolvedInline(resolvedHost, offset, addr, value); return;
+        case 4u: PpcStorePairPsqQuantizedResolvedInline<uint8_t>(resolvedHost, offset, addr, value, 0u); return;
+        case 5u: PpcStorePairPsqQuantizedResolvedInline<uint16_t>(resolvedHost, offset, addr, value, 0u); return;
+        case 6u: PpcStorePairPsqQuantizedResolvedInline<int8_t>(resolvedHost, offset, addr, value, 0u); return;
+        case 7u: PpcStorePairPsqQuantizedResolvedInline<int16_t>(resolvedHost, offset, addr, value, 0u); return;
+        default: PPC_PsqStResolvedStateFallback<W>(gqr, resolvedHost, offset, addr, value); return;
         }
     }
     else
     {
-        switch (type)
+        switch (gqr & 0x3F07u)
         {
-        case 0u: PpcStoreSinglePsqFloatResolvedInline(resolvedHost, offset, addr, value); return;
-        case 4u: PpcStoreSinglePsqQuantizedResolvedInline<uint8_t>(resolvedHost, offset, addr, value, scale); return;
-        case 5u: PpcStoreSinglePsqQuantizedResolvedInline<uint16_t>(resolvedHost, offset, addr, value, scale); return;
-        case 6u: PpcStoreSinglePsqQuantizedResolvedInline<int8_t>(resolvedHost, offset, addr, value, scale); return;
-        case 7u: PpcStoreSinglePsqQuantizedResolvedInline<int16_t>(resolvedHost, offset, addr, value, scale); return;
-        default: std::abort();
+        case 4u: PpcStoreSinglePsqQuantizedResolvedInline<uint8_t>(resolvedHost, offset, addr, value, 0u); return;
+        case 5u: PpcStoreSinglePsqQuantizedResolvedInline<uint16_t>(resolvedHost, offset, addr, value, 0u); return;
+        case 6u: PpcStoreSinglePsqQuantizedResolvedInline<int8_t>(resolvedHost, offset, addr, value, 0u); return;
+        case 7u: PpcStoreSinglePsqQuantizedResolvedInline<int16_t>(resolvedHost, offset, addr, value, 0u); return;
+        default: PPC_PsqStResolvedStateFallback<W>(gqr, resolvedHost, offset, addr, value); return;
         }
     }
 }

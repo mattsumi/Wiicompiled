@@ -4,11 +4,12 @@
 #include <dolphin/pad.h>
 #include <dolphin/si.h>
 #include <SDL3/SDL_mouse.h>
+#include <SDL3/SDL_joystick.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <sys/stat.h>
-#include <ranges>
 
 namespace {
 constexpr int32_t k_mappingsFileVersion = 3;
@@ -193,6 +194,32 @@ std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsJoyPair{{
     {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, PAD_BUTTON_RIGHT},
 }};
 
+// Wii U Pro Controllers through SDL's HIDAPI Wii driver. No SDL_GamepadType
+// singles them out, so they are picked by the name the driver gives them (see
+// __PADSetDefaultMapping). Wii Remotes, with or without a Nunchuk or Classic
+// Controller, are read by the game through KPAD instead and never get a
+// GameCube mapping (the runtime hides those ports from PADRead).
+
+// Nintendo's labelled layout: A on the right accelerates, B at the bottom
+// brakes. SDL's Wii driver reports ZL/ZR as the LEFT_TRIGGER/RIGHT_TRIGGER
+// axes, never as shoulder buttons, so they are left unbound here and picked up
+// by aurora's default axis mapping (g_defaultAxes) the same way every
+// analog-trigger pad's L/R is.
+std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsWiiUPro{{
+    {SDL_GAMEPAD_BUTTON_EAST, PAD_BUTTON_A},
+    {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_B},
+    {SDL_GAMEPAD_BUTTON_NORTH, PAD_BUTTON_X},
+    {SDL_GAMEPAD_BUTTON_WEST, PAD_BUTTON_Y},
+    {SDL_GAMEPAD_BUTTON_START, PAD_BUTTON_START},
+    {SDL_GAMEPAD_BUTTON_BACK, PAD_TRIGGER_Z},
+    {PAD_NATIVE_BUTTON_INVALID, PAD_TRIGGER_L},
+    {PAD_NATIVE_BUTTON_INVALID, PAD_TRIGGER_R},
+    {SDL_GAMEPAD_BUTTON_DPAD_UP, PAD_BUTTON_UP},
+    {SDL_GAMEPAD_BUTTON_DPAD_DOWN, PAD_BUTTON_DOWN},
+    {SDL_GAMEPAD_BUTTON_DPAD_LEFT, PAD_BUTTON_LEFT},
+    {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, PAD_BUTTON_RIGHT},
+}};
+
 std::array<PADKeyButtonBinding, PAD_BUTTON_COUNT> g_defaultKeys{{
     {PAD_KEY_INVALID, PAD_BUTTON_A},
     {PAD_KEY_INVALID, PAD_BUTTON_B},
@@ -292,6 +319,18 @@ std::array<bool, PAD_CHANMAX> g_suppressLeftTrigger{};
 std::array<bool, PAD_CHANMAX> g_suppressRightTrigger{};
 
 bool is_mouse_scancode(const s32 scancode) { return scancode < PAD_KEY_INVALID; }
+bool is_native_binding_pressed(SDL_Gamepad* gamepad, u32 binding) {
+  if (PADIsAxisButton(binding)) {
+    const u32 axis = PADAxisButtonAxis(binding);
+    const u32 threshold = PADAxisButtonThreshold(binding);
+    if (axis >= SDL_GAMEPAD_AXIS_COUNT || threshold < 1 || threshold > 100) return false;
+    int value = SDL_GetGamepadAxis(gamepad, static_cast<SDL_GamepadAxis>(axis));
+    if (PADAxisButtonNegative(binding)) value = -value;
+    return value > 0 && value * 100 >= static_cast<int>(threshold) * 32767;
+  }
+  return binding < SDL_GAMEPAD_BUTTON_COUNT &&
+         SDL_GetGamepadButton(gamepad, static_cast<SDL_GamepadButton>(binding));
+}
 bool is_mouse_button_pressed(const s32 scancode) {
   const int32_t buttonNum = -(scancode + 1);
   if (buttonNum < 1 || buttonNum > 5) {
@@ -315,7 +354,7 @@ BOOL PADInit() {
   }
   g_initialized = true;
 
-  std::ranges::for_each(g_keyboardBindings, [](auto& state) {
+  std::for_each(g_keyboardBindings.begin(), g_keyboardBindings.end(), [](auto& state) {
     state.m_buttonMapping = g_defaultKeys;
     state.m_axisMapping = g_defaultKeyAxis;
   });
@@ -360,19 +399,20 @@ const char* PADGetNameForControllerIndex(const u32 idx) {
 }
 
 void PADSetPortForIndex(const u32 idx, const u32 port) {
+  if (port >= PAD_MAX_CONTROLLERS) return;
   const auto* ctrl = __PADGetControllerForIndex(idx);
   if (ctrl == nullptr) {
     return;
   }
 
-  const int32_t oldPort = SDL_GetGamepadPlayerIndex(ctrl->m_controller);
+  const int32_t oldPort = aurora::input::player_index(ctrl->m_index);
   if (const auto* dest = aurora::input::get_controller_for_player(port); dest != nullptr && dest != ctrl) {
-    SDL_SetGamepadPlayerIndex(dest->m_controller, -1);
+    aurora::input::set_player_index(dest->m_index, -1);
   }
   if (oldPort >= 0 && oldPort != port) {
     aurora::input::persist_controller_for_player(oldPort, nullptr);
   }
-  SDL_SetGamepadPlayerIndex(ctrl->m_controller, static_cast<Sint32>(port));
+  aurora::input::set_player_index(ctrl->m_index, static_cast<Sint32>(port));
   aurora::input::persist_controller_for_player(port, ctrl);
 }
 
@@ -398,7 +438,7 @@ void PADClearPort(const u32 port) {
   if (ctrl == nullptr) {
     return;
   }
-  SDL_SetGamepadPlayerIndex(ctrl->m_controller, -1);
+  aurora::input::set_player_index(ctrl->m_index, -1);
 }
 
 // Secondary bindings live only in memory; the runtime re-applies them from its
@@ -409,8 +449,26 @@ static void reset_alt_button_mapping(aurora::input::GameController* controller) 
   }
 }
 
+// SDL's hidapi Wii driver names the pad "Nintendo Wii U Pro Controller"; the
+// other names it produces are Wii Remotes, which the game reads through KPAD
+// and which therefore never take a GameCube mapping.
+static bool wii_default_mapping(const aurora::input::GameController* controller,
+                                std::array<PADButtonMapping, PAD_BUTTON_COUNT>& out) {
+  const char* name = SDL_GetGamepadName(controller->m_controller);
+  if (name == nullptr || SDL_strstr(name, "Wii U Pro Controller") == nullptr) {
+    return false;
+  }
+  out = g_defaultButtonsWiiUPro;
+  return true;
+}
+
+// Picks the default button table for a controller by name (Wii pads) or SDL gamepad type.
 void __PADSetDefaultMapping(aurora::input::GameController* controller) /*  NOLINT(*-reserved-identifier) */
 {
+  if (wii_default_mapping(controller, controller->m_buttonMapping)) {
+    reset_alt_button_mapping(controller);
+    return;
+  }
   switch (SDL_GetGamepadType(controller->m_controller)) {
   case SDL_GAMEPAD_TYPE_XBOX360:
     controller->m_buttonMapping = g_defaultButtonsXBox360;
@@ -589,8 +647,8 @@ static void EnsureMappingLoaded(aurora::input::GameController* controller) {
 
 static Sint16 _get_axis_value(const aurora::input::GameController* controller, //  NOLINT(*-reserved-identifier)
                               PADAxis axis) {
-  const auto iter =
-      std::ranges::find_if(controller->m_axisMapping, [axis](const auto& pair) { return pair.padAxis == axis; });
+  const auto iter = std::find_if(controller->m_axisMapping.begin(), controller->m_axisMapping.end(),
+                                 [axis](const auto& pair) { return pair.padAxis == axis; });
   if (iter == controller->m_axisMapping.end()) {
     return 0;
   }
@@ -679,10 +737,10 @@ u32 PADRead(PADStatus* status) {
     }
 
     status[i].err = PAD_ERR_NONE;
-    if (g_keyboardBindings[i].m_mappingsSet) {
-      std::ranges::for_each(
-          g_keyboardBindings[i].m_buttonMapping, [&kbState, &i, &status](const PADKeyButtonBinding& mapping) {
-            if (mapping.scancode > PAD_KEY_INVALID && kbState[mapping.scancode]) {
+    if (g_keyboardBindings[i].m_mappingsSet && SDL_GetKeyboardFocus() != nullptr) {
+      std::for_each(g_keyboardBindings[i].m_buttonMapping.begin(), g_keyboardBindings[i].m_buttonMapping.end(),
+                    [&kbState, &numKeys, &i, &status](const PADKeyButtonBinding& mapping) {
+            if (mapping.scancode > PAD_KEY_INVALID && mapping.scancode < numKeys && kbState[mapping.scancode]) {
               status[i].button |= mapping.padButton;
             } else if (is_mouse_scancode(mapping.scancode) && is_mouse_button_pressed(mapping.scancode)) {
               status[i].button |= mapping.padButton;
@@ -743,13 +801,54 @@ u32 PADRead(PADStatus* status) {
       status[i].triggerRight = static_cast<u8>(std::min(static_cast<int>(status[i].triggerRight) + tr, 255));
     }
 
-    if (controller) {
+    if (controller && !g_keyboardBindings[i].m_mappingsSet) {
       EnsureMappingLoaded(controller);
+
+      // Wii U Pro Controller raw D-pad fallback. SDL's HIDAPI Wii driver posts
+      // the D-pad as joystick buttons 11-14 (the SDL_GAMEPAD_BUTTON_DPAD_*
+      // values) and never as a hat, but the mapping SDL generates for HIDAPI
+      // pads binds the D-pad to hat 0, so SDL_GetGamepadButton(DPAD_*) stays
+      // false. Keep this restricted to the Wii driver's pad so raw button
+      // indices don't interfere with other controller types.
+      const char* name = SDL_GetGamepadName(controller->m_controller);
+      const bool isWiiUPro = name != nullptr && SDL_strstr(name, "Wii U Pro Controller") != nullptr;
+
+      if (isWiiUPro) {
+        SDL_Joystick* joystick =
+            SDL_GetGamepadJoystick(controller->m_controller);
+
+        uint32_t raw = 0;
+        const int buttonCount = SDL_GetNumJoystickButtons(joystick);
+
+        for (int b = 0; b < buttonCount && b < 32; ++b) {
+          if (SDL_GetJoystickButton(joystick, b)) {
+            raw |= (1u << b);
+          }
+        }
+
+        // Up    = button 11
+        if (raw & (1u << 11)) {
+          status[i].button |= PAD_BUTTON_UP;
+        }
+        // Down  = button 12
+        if (raw & (1u << 12)) {
+          status[i].button |= PAD_BUTTON_DOWN;
+        }
+        // Left  = button 13
+        if (raw & (1u << 13)) {
+          status[i].button |= PAD_BUTTON_LEFT;
+        }
+        // Right = button 14
+        if (raw & (1u << 14)) {
+          status[i].button |= PAD_BUTTON_RIGHT;
+        }
+      }
+
       bool leftTriggerSet = false;
       bool rightTriggerSet = false;
-      std::ranges::for_each(controller->m_buttonMapping, [&controller, &i, &status, &leftTriggerSet,
-                                                          &rightTriggerSet](const auto& mapping) {
-        if (SDL_GetGamepadButton(controller->m_controller, static_cast<SDL_GamepadButton>(mapping.nativeButton))) {
+      std::for_each(controller->m_buttonMapping.begin(), controller->m_buttonMapping.end(),
+                    [&controller, &i, &status, &leftTriggerSet, &rightTriggerSet](const auto& mapping) {
+        if (is_native_binding_pressed(controller->m_controller, mapping.nativeButton)) {
           status[i].button |= mapping.padButton;
         }
 
@@ -761,12 +860,12 @@ u32 PADRead(PADStatus* status) {
         }
       });
 
-      std::ranges::for_each(controller->m_altButtonMapping, [&controller, &i, &status, &leftTriggerSet,
-                                                             &rightTriggerSet](const auto& mapping) {
+      std::for_each(controller->m_altButtonMapping.begin(), controller->m_altButtonMapping.end(),
+                    [&controller, &i, &status, &leftTriggerSet, &rightTriggerSet](const auto& mapping) {
         if (mapping.nativeButton == PAD_NATIVE_BUTTON_INVALID) {
           return;
         }
-        if (SDL_GetGamepadButton(controller->m_controller, static_cast<SDL_GamepadButton>(mapping.nativeButton))) {
+        if (is_native_binding_pressed(controller->m_controller, mapping.nativeButton)) {
           status[i].button |= mapping.padButton;
         }
 
@@ -777,6 +876,7 @@ u32 PADRead(PADStatus* status) {
           rightTriggerSet = true;
         }
       });
+
 
       // TODO: Add serializable mappings for these (probably not necessary)?
       static constexpr std::array<std::pair<SDL_GamepadButton, PADExtButton>, PAD_EXT_BUTTON_COUNT> kExtButtonMappings{{
@@ -859,6 +959,17 @@ u32 PADRead(PADStatus* status) {
       Sint16 tl = std::max(static_cast<Sint16>(0), _get_axis_value(controller, PAD_AXIS_TRIGGER_L));
       Sint16 tr = std::max(static_cast<Sint16>(0), _get_axis_value(controller, PAD_AXIS_TRIGGER_R));
 
+      // Games can read either the digital L/R bits or their analog pressure.
+      // An explicit button binding must drive both, otherwise the original
+      // L2/R2 axis still activates L/R even when it was rebound to L1/R1.
+      // Real GC pads retain independent analog travel and end-stop clicks.
+      if (!(controller->m_isGameCube ||
+            (SDL_GetGamepadType(controller->m_controller) == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO &&
+             controller->m_pid == 0x2073))) {
+        if (leftTriggerSet) tl = (status[i].button & PAD_TRIGGER_L) != 0 ? 32767 : 0;
+        if (rightTriggerSet) tr = (status[i].button & PAD_TRIGGER_R) != 0 ? 32767 : 0;
+      }
+
       if (controller->m_deadZones.emulateTriggers) {
         if (!leftTriggerSet && tl > controller->m_deadZones.leftTriggerActivationZone) {
           status[i].button |= PAD_TRIGGER_L;
@@ -903,12 +1014,13 @@ void PADControlMotor(const u32 chan, const u32 cmd) {
   }
 
   if (controller->m_isGameCube) {
-    if (cmd == PAD_MOTOR_STOP) {
-      aurora::input::controller_rumble(instance, 0, 1, 0);
+    if (cmd == PAD_MOTOR_STOP || cmd == PAD_MOTOR_STOP_HARD) {
+      // Use an unambiguous motor-off request. The (0, 1) coast encoding
+      // requires SDL's GameCube brake mode; other backends or an overridden
+      // hint interpret it as rumble and can leave the controller vibrating.
+      aurora::input::controller_rumble(instance, 0, 0, 0);
     } else if (cmd == PAD_MOTOR_RUMBLE) {
       aurora::input::controller_rumble(instance, 1, 1, 0);
-    } else if (cmd == PAD_MOTOR_STOP_HARD) {
-      aurora::input::controller_rumble(instance, 0, 0, 0);
     }
   } else {
     if (cmd == PAD_MOTOR_STOP) {
@@ -1078,8 +1190,8 @@ void PADSetButtonMapping(const u32 port, const PADButtonMapping mapping) {
     return;
   }
 
-  const auto iter = std::ranges::find_if(controller->m_buttonMapping,
-                                         [mapping](const auto& pair) { return mapping.padButton == pair.padButton; });
+  const auto iter = std::find_if(controller->m_buttonMapping.begin(), controller->m_buttonMapping.end(),
+                                 [mapping](const auto& pair) { return mapping.padButton == pair.padButton; });
   if (iter == controller->m_buttonMapping.end()) {
     return;
   }
@@ -1112,8 +1224,8 @@ void PADSetAltButtonMapping(const u32 port, const PADButtonMapping mapping) {
     return;
   }
 
-  const auto iter = std::ranges::find_if(controller->m_altButtonMapping,
-                                         [mapping](const auto& pair) { return mapping.padButton == pair.padButton; });
+  const auto iter = std::find_if(controller->m_altButtonMapping.begin(), controller->m_altButtonMapping.end(),
+                                 [mapping](const auto& pair) { return mapping.padButton == pair.padButton; });
   if (iter == controller->m_altButtonMapping.end()) {
     return;
   }
@@ -1139,8 +1251,8 @@ void PADSetAxisMapping(const u32 port, const PADAxisMapping mapping) {
     return;
   }
 
-  const auto iter = std::ranges::find_if(controller->m_axisMapping,
-                                         [mapping](const auto& pair) { return mapping.padAxis == pair.padAxis; });
+  const auto iter = std::find_if(controller->m_axisMapping.begin(), controller->m_axisMapping.end(),
+                                 [mapping](const auto& pair) { return mapping.padAxis == pair.padAxis; });
   if (iter == controller->m_axisMapping.end()) {
     return;
   }
@@ -1191,6 +1303,11 @@ BOOL PADSetKeyButtonBindings(const u32 port, PADKeyButtonBinding bindings[PAD_BU
 }
 
 PADKeyButtonBinding* PADGetKeyButtonBindings(const u32 port, u32* buttonCount) {
+  PADInit();
+  if (!g_keyboardBindingsLoaded) {
+    g_keyboardBindingsLoaded = true;
+    load_keyboard_bindings();
+  }
   if (port >= PAD_MAX_CONTROLLERS || !g_keyboardBindings[port].m_mappingsSet) {
     return nullptr;
   }
@@ -1309,9 +1426,10 @@ static void load_keyboard_bindings() {
 
     if (mappingsSet) {
       const bool anyBound =
-          std::ranges::any_of(buttonMapping,
-                              [](const PADKeyButtonBinding& b) { return b.scancode != PAD_KEY_INVALID; }) ||
-          std::ranges::any_of(axisMapping, [](const PADKeyAxisBinding& b) { return b.scancode != PAD_KEY_INVALID; });
+          std::any_of(buttonMapping.begin(), buttonMapping.end(),
+                      [](const PADKeyButtonBinding& b) { return b.scancode != PAD_KEY_INVALID; }) ||
+          std::any_of(axisMapping.begin(), axisMapping.end(),
+                      [](const PADKeyAxisBinding& b) { return b.scancode != PAD_KEY_INVALID; });
       if (!anyBound) {
         mappingsSet = false;
       }
@@ -1351,7 +1469,10 @@ void __PADWriteDeadZones(SDL_IOStream* file, // NOLINT(*-reserved-identifier)
 void PADSerializeMappings() {
   const std::filesystem::path basePath = fs_path_from_string(aurora::g_config.userPath);
 
-  for (auto& controller : aurora::input::g_GameControllers | std::views::values) {
+  // Avoid std::views::values here: older Apple libc++ releases implement the
+  // C++20 ranges algorithms we use but not this adaptor.
+  for (auto& entry : aurora::input::g_GameControllers) {
+    auto& controller = entry.second;
     EnsureMappingLoaded(&controller);
     const auto filePath =
         basePath / fmt::format("{}_{:04X}_{:04X}.controller", aurora::input::controller_name(controller.m_index),
@@ -1453,8 +1574,8 @@ static constexpr std::array<std::pair<PADButton, std::string_view>, PAD_AXIS_COU
 
 const char* PADGetButtonName(const PADButton button) {
 
-  if (const auto iter =
-          std::ranges::find_if(skButtonNames, [&button](const auto& pair) { return button == pair.first; });
+  if (const auto iter = std::find_if(skButtonNames.begin(), skButtonNames.end(),
+                                     [&button](const auto& pair) { return button == pair.first; });
       iter != skButtonNames.end()) {
     return iter->second.data();
   }
@@ -1467,7 +1588,8 @@ const char* PADGetNativeButtonName(u32 button) {
 }
 
 const char* PADGetAxisName(const PADAxis axis) {
-  if (const auto it = std::ranges::find_if(skAxisNames, [&axis](const auto& pair) { return axis == pair.first; });
+  if (const auto it = std::find_if(skAxisNames.begin(), skAxisNames.end(),
+                                   [&axis](const auto& pair) { return axis == pair.first; });
       it != skAxisNames.end()) {
     return it->second.data();
   }
@@ -1476,7 +1598,8 @@ const char* PADGetAxisName(const PADAxis axis) {
 }
 
 const char* PADGetAxisDirectionLabel(const PADAxis axis) {
-  if (const auto it = std::ranges::find_if(skAxisDirLabels, [&axis](const auto& pair) { return axis == pair.first; });
+  if (const auto it = std::find_if(skAxisDirLabels.begin(), skAxisDirLabels.end(),
+                                   [&axis](const auto& pair) { return axis == pair.first; });
       it != skAxisDirLabels.end()) {
     return it->second.data();
   }

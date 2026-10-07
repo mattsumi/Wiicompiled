@@ -21,7 +21,7 @@ static int32_t NewWiiSocket(uint32_t af, uint32_t type, uint32_t protocol) {
     return wiiFd;
 }
 
-static int32_t DeleteWiiSocket(uint32_t fd) {
+int32_t DeleteWiiSocket(uint32_t fd) {
     WiiSocket* s = GetWiiSocket(fd);
     if (!s) {
         return -SO_EBADF;
@@ -467,7 +467,8 @@ int32_t HandleIpTopIoctlv(uint32_t cmd, const std::vector<IoVector>& in, const s
         const int ret = sendto(s->native, reinterpret_cast<const char*>(sendData), static_cast<int>(sendSize),
                                static_cast<int>(flags), destPtr, destLen);
         const int hostError = ret < 0 ? NativeLastError() : 0;
-        int32_t result = SocketResult(ret);
+        // Diagnostics may change the native error; use the send result captured above.
+        int32_t result = ret >= 0 ? SocketResult(ret) : SocketErrorResult(hostError);
         if (patchedWrite && ret == static_cast<int>(sendSize)) {
             result = static_cast<int32_t>(in[0].size);
         }
@@ -499,7 +500,7 @@ int32_t HandleIpTopIoctlv(uint32_t cmd, const std::vector<IoVector>& in, const s
         // Nonblocking sockets get -SO_EAGAIN immediately (Dolphin's retry predicate
         // short-circuits on nonBlock/forceNonBlock, IOS/Network/Socket.cpp:715-718);
         // waiting here anyway stalled the whole emulation thread on every empty read.
-        constexpr int kStreamRecvWaitMs = 250;
+        constexpr int kStreamRecvWaitMs = 1000;
         const int streamWaitMs = (forceNonBlock || s->nonblocking) ? 0 : kStreamRecvWaitMs;
         const bool waited = ret < 0 && !fromPtr && s->type == SOCK_STREAM &&
             IsWouldBlockError(nativeErr) && WaitForReadable(s->native, streamWaitMs);

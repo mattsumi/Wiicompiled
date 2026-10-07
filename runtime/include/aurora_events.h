@@ -16,7 +16,9 @@
 #endif
 
 extern "C" bool g_dynamicAspectRatioEnabled;
-void ConfigureMkwDynamicAspect(bool widescreen, uint32_t surfaceWidth, uint32_t surfaceHeight);
+void ConfigureMkwDynamicAspect(bool widescreen, bool forceAspect169, uint32_t surfaceWidth, uint32_t surfaceHeight);
+void SetMkwForceAspect169(bool enabled);
+bool MkwForceAspect169Requested();
 void UpdateMkwDynamicAspectSurface(uint32_t surfaceWidth, uint32_t surfaceHeight);
 // Arms the "keep EGG::Frustum's projection scale" flag on every screen that
 // renders to a fixed-size offscreen target. Cheap and idempotent; called from
@@ -58,6 +60,7 @@ inline void Flush(bool force = false) {
 // still active.  A window close is an intentional successful exit, so end the
 // process directly and do not run the crash/atexit paths.
 [[noreturn]] inline void ExitForAuroraWindowClose() noexcept {
+    settings_overlay::ReleaseControllers();
     WindowPlacementPersistence::Flush(true);
 #if defined(_WIN32)
     ::ExitProcess(0);

@@ -8,8 +8,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -17,6 +19,7 @@
 #include <utility>
 #include <vector>
 #include <toml.hpp>
+#include "platform/host_platform.h"
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -30,6 +33,7 @@
 
 struct RuntimeUserConfig {
     std::optional<bool> widescreen;
+    std::optional<bool> forceAspect169;
     std::optional<int32_t> windowPosX;
     std::optional<int32_t> windowPosY;
     std::optional<uint32_t> windowWidth;
@@ -38,6 +42,7 @@ struct RuntimeUserConfig {
     std::optional<std::string> graphicsApi;
     std::optional<std::string> displayMode;
     std::optional<uint32_t> frameInterpolationFps;
+    std::optional<bool> metalFxSpatialUpscaling;
     std::optional<bool> skipUnreadyPipelines;
     std::optional<bool> disableCopyFilter;
     std::optional<bool> textureReplacements;
@@ -52,7 +57,31 @@ struct RuntimeUserConfig {
     std::optional<bool> audioMuted;
     std::optional<bool> audioMixWorker;
     std::optional<bool> attenuateMusicWhenMediaPlays;
+    // Real Wii Remotes (with or without Nunchuk / Classic Controller) and Wii U Pro
+    // Controllers paired over Bluetooth, driven by SDL's HIDAPI Wii driver. The driver
+    // is opt-in on SDL's side, so this decides whether the runtime turns it on.
+    std::optional<bool> wiiRemotes;
+    // Keep re-enumerating Bluetooth HID devices while no Wii controller is connected
+    // (Dolphin's "continuous scanning"), so a remote that dropped or was switched on
+    // after launch shows up without restarting.
+    std::optional<bool> wiiContinuousScan;
+    // Accelerometer zero-point correction for the Bluetooth Wii Remote, in g and in
+    // SDL's sensor frame (x right, y out of the button face, z towards the user).
+    // SDL's Wii driver falls back to a nominal zero point when its read of the
+    // remote's calibration block times out (common over Bluetooth), so this is
+    // measured in the overlay with the remote at rest.
+    std::optional<double> wiiAccelOffsetX;
+    std::optional<double> wiiAccelOffsetY;
+    std::optional<double> wiiAccelOffsetZ;
+    // Debugging aid: append every KPAD sample of the Bluetooth remote (raw and
+    // corrected accelerometer, buttons) to wii_accel_trace.csv next to Config.toml.
+    std::optional<bool> wiiAccelTrace;
     std::optional<bool> networkEnabled;
+    std::optional<bool> discordPresenceEnabled;
+    // The application ID of the WiiCompiled Discord application. This is only
+    // used by the base product; Retro Rewind supplies its own ID through the
+    // standard Dolphin /dev/dolphin interface.
+    std::optional<std::string> discordClientId;
     std::optional<std::string> nandRoot;
     std::optional<std::string> dvdRoot;
     // The one canonical Retro Rewind installation, owned and updated by the frontend. Setup records
@@ -68,9 +97,13 @@ struct RuntimeUserConfig {
     std::optional<int32_t> ffbSpring;
     std::optional<int32_t> ffbVibration;
     std::optional<bool> ffbForceWheel;
+    std::optional<std::string> ffbWheelGuid;
     std::optional<int32_t> steeringSensitivity;
     std::optional<int32_t> acceleratorAxis;
     std::optional<int32_t> brakeAxis;
+    std::optional<bool> rumbleEnabled;
+    std::optional<int32_t> muteHotkey;
+    std::map<std::string, std::string> controllerExpressions;
 };
 
 namespace RuntimeConfigFile {
@@ -144,7 +177,14 @@ inline bool IsSupportedResolutionMultiplier(float value) {
 // Must stay in step with the backend table in main.cpp, which is what actually
 // maps these to AuroraBackend.
 inline bool IsSupportedGraphicsApi(std::string_view value) {
+#if defined(__APPLE__)
+    static constexpr std::array<std::string_view, 2> values{"auto", "metal"};
+// only vulkan for linux
+#elif defined(__linux__)
+    static constexpr std::array<std::string_view, 2> values{"auto", "vulkan"};
+#elif defined(_WIN32)
     static constexpr std::array<std::string_view, 3> values{"auto", "d3d12", "vulkan"};
+#endif
     return std::find(values.begin(), values.end(), value) != values.end();
 }
 
@@ -175,6 +215,8 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
         }
         buffer.resize(buffer.size() * 2);
     }
+#elif defined(__APPLE__)
+    return RuntimePlatform::ExecutableDirectory();
 #else
     // /proc/self/exe is a Linux-specific magic symlink to the running executable; readlink()
     // does not NUL-terminate and silently truncates if the buffer is too small, so this grows
@@ -232,6 +274,8 @@ inline std::filesystem::path ApplicationDataDirectory() {
         CoTaskMemFree(rawPath);
         return directory;
     }
+#elif defined(__APPLE__)
+    return RuntimePlatform::ApplicationDataDirectory(kApplicationDirectoryName);
 #else
     // XDG Base Directory spec equivalent of FOLDERID_LocalAppData: $XDG_DATA_HOME if set and
     // non-empty, otherwise its default of $HOME/.local/share.
@@ -265,6 +309,7 @@ inline void EnsureConfigFile() {
               "# Set paths.dvd_root to an extracted Mario Kart Wii DATA directory.\n\n"
               "[video]\n"
               "widescreen = true\n"
+              "force_16_9 = false\n"
               "resolution_multiplier = 1.0\n"
               "frame_interpolation_fps = 0\n"
               "display_mode = \"windowed\"\n"
@@ -294,6 +339,12 @@ inline void EnsureConfigFile() {
               "mix_worker = true\n\n"
               "[network]\n"
               "enabled = true\n\n"
+              "[discord]\n"
+              "# Rich Presence talks only to a locally-running Discord client.\n"
+              "# Retro Rewind supplies its official app ID automatically. Set this\n"
+              "# to WiiCompiled's Discord application ID for basic base-game presence.\n"
+              "enabled = true\n"
+              "# client_id = \"123456789012345678\"\n\n"
               "[paths]\n"
               "# dvd_root = \"D:\\\\MarioKartWii\\\\DATA\"\n"
               "# nand_root = \"D:\\\\WiiNand\"\n"
@@ -360,6 +411,7 @@ inline void AppendOverlayRoots(RuntimeUserConfig& config, const std::string& roo
     }
 }
 
+// Reads every supported setting out of a parsed Config.toml document.
 inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     RuntimeUserConfig config;
 
@@ -376,11 +428,26 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     config.ffbSpring = FindConfigInt(document, "ffb", "spring");
     config.ffbVibration = FindConfigInt(document, "ffb", "vibration");
     config.ffbForceWheel = FindConfigValue<bool>(document, "ffb", "force_wheel");
+    config.ffbWheelGuid = FindConfigValue<std::string>(document, "ffb", "force_wheel_guid");
     config.steeringSensitivity = FindConfigInt(document, "controller", "steering_sensitivity");
     config.acceleratorAxis = FindConfigInt(document, "controller", "accelerator_axis");
     config.brakeAxis = FindConfigInt(document, "controller", "brake_axis");
+    config.rumbleEnabled = FindConfigValue<bool>(document, "controller", "rumble");
+    if (auto value = FindConfigInt(document, "audio", "mute_key")) {
+        config.muteHotkey = *value;
+    }
+
+    if (const auto* section = document.contains("controller") ? &document.at("controller") : nullptr;
+        section != nullptr && section->is_table()) {
+        for (const auto& [key, value] : section->as_table()) {
+            if (key.rfind("expr_", 0) == 0 && value.is_string()) {
+                config.controllerExpressions[key] = value.as_string();
+            }
+        }
+    }
 
     config.widescreen = FindConfigValue<bool>(document, "video", "widescreen");
+    config.forceAspect169 = FindConfigValue<bool>(document, "video", "force_16_9");
     config.windowPosX = FindConfigInt(document, "video", "window_x");
     config.windowPosY = FindConfigInt(document, "video", "window_y");
     if (auto value = FindConfigUint(document, "video", "window_width"); value && *value != 0) {
@@ -411,6 +478,8 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
             config.frameInterpolationFps = migrated;
         }
     }
+    config.metalFxSpatialUpscaling =
+        FindConfigValue<bool>(document, "video", "metalfx_spatial_upscaling");
     config.skipUnreadyPipelines = FindConfigValue<bool>(document, "video", "skip_unready_pipelines");
     config.disableCopyFilter = FindConfigValue<bool>(document, "video", "disable_copy_filter");
     config.showFps = FindConfigValue<bool>(document, "video", "show_fps");
@@ -434,7 +503,15 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     config.audioMixWorker = FindConfigValue<bool>(document, "audio", "mix_worker");
     config.attenuateMusicWhenMediaPlays =
         FindConfigValue<bool>(document, "audio", "attenuate_music_when_media_plays");
+    config.wiiRemotes = FindConfigValue<bool>(document, "controller", "wii_remotes");
+    config.wiiContinuousScan = FindConfigValue<bool>(document, "controller", "wii_continuous_scan");
+    config.wiiAccelOffsetX = FindConfigValue<double>(document, "controller", "wii_accel_offset_x");
+    config.wiiAccelOffsetY = FindConfigValue<double>(document, "controller", "wii_accel_offset_y");
+    config.wiiAccelOffsetZ = FindConfigValue<double>(document, "controller", "wii_accel_offset_z");
+    config.wiiAccelTrace = FindConfigValue<bool>(document, "controller", "wii_accel_trace");
     config.networkEnabled = FindConfigValue<bool>(document, "network", "enabled");
+    config.discordPresenceEnabled = FindConfigValue<bool>(document, "discord", "enabled");
+    config.discordClientId = FindConfigValue<std::string>(document, "discord", "client_id");
 
     config.nandRoot = FindConfigValue<std::string>(document, "paths", "nand_root");
     config.dvdRoot = FindConfigValue<std::string>(document, "paths", "dvd_root");
@@ -505,14 +582,18 @@ inline bool FfbForceWheel(bool fallback = false) {
     return Get().ffbForceWheel.value_or(fallback);
 }
 
+inline std::string FfbWheelGuid() {
+    return Get().ffbWheelGuid.value_or("");
+}
+
 inline int32_t AcceleratorAxis(int32_t fallback = -1) {
     const int32_t value = Get().acceleratorAxis.value_or(fallback);
-    return value >= 1 && value <= 7 ? value : -1;
+    return value >= 0 && value <= 7 ? value : -1;
 }
 
 inline int32_t BrakeAxis(int32_t fallback = -1) {
     const int32_t value = Get().brakeAxis.value_or(fallback);
-    return value >= 1 && value <= 7 ? value : -1;
+    return value >= 0 && value <= 7 ? value : -1;
 }
 
 inline int32_t SteeringSensitivity(int32_t fallback = 350) {
@@ -636,6 +717,11 @@ inline bool SetFrameInterpolationFps(uint32_t value) {
     return WriteSetting("video", "frame_interpolation_fps", std::to_string(value));
 }
 
+inline bool SetMetalFxSpatialUpscaling(bool value) {
+    Mutable().metalFxSpatialUpscaling = value;
+    return WriteSetting("video", "metalfx_spatial_upscaling", value ? "true" : "false");
+}
+
 inline bool SetDisplayMode(std::string value) {
     if (!IsSupportedDisplayMode(value)) {
         return false;
@@ -679,6 +765,14 @@ inline bool SetFfbEnabled(bool value) {
     return WriteSetting("ffb", "enabled", value ? "true" : "false");
 }
 
+inline bool SetFfbWheelGuid(std::string value) {
+    Mutable().ffbWheelGuid = value;
+    Mutable().ffbForceWheel = !value.empty();
+    const bool guidSaved = WriteSetting("ffb", "force_wheel_guid", FormatString(value));
+    const bool enabledSaved = WriteSetting("ffb", "force_wheel", value.empty() ? "false" : "true");
+    return guidSaved && enabledSaved;
+}
+
 inline bool SetFfbStrength(int32_t value) {
     value = std::clamp(value, 0, 100);
     Mutable().ffbStrength = value;
@@ -692,13 +786,13 @@ inline bool SetFfbSpring(int32_t value) {
 }
 
 inline bool SetAcceleratorAxis(int32_t value) {
-    value = value >= 1 && value <= 7 ? value : -1;
+    value = value >= 0 && value <= 7 ? value : -1;
     Mutable().acceleratorAxis = value;
     return WriteSetting("controller", "accelerator_axis", std::to_string(value));
 }
 
 inline bool SetBrakeAxis(int32_t value) {
-    value = value >= 1 && value <= 7 ? value : -1;
+    value = value >= 0 && value <= 7 ? value : -1;
     Mutable().brakeAxis = value;
     return WriteSetting("controller", "brake_axis", std::to_string(value));
 }
@@ -713,6 +807,34 @@ inline bool SetFfbVibration(int32_t value) {
     value = std::clamp(value, 0, 100);
     Mutable().ffbVibration = value;
     return WriteSetting("ffb", "vibration", std::to_string(value));
+}
+
+inline std::string ControllerExpression(const std::string& key) {
+    const auto it = Get().controllerExpressions.find(key);
+    return it == Get().controllerExpressions.end() ? std::string() : it->second;
+}
+
+inline bool SetControllerExpression(const std::string& key, const std::string& value) {
+    Mutable().controllerExpressions[key] = value;
+    return WriteSetting("controller", key, FormatString(value));
+}
+
+inline bool RumbleEnabled(bool fallback = true) {
+    return Get().rumbleEnabled.value_or(fallback);
+}
+
+inline bool SetRumbleEnabled(bool value) {
+    Mutable().rumbleEnabled = value;
+    return WriteSetting("controller", "rumble", value ? "true" : "false");
+}
+
+inline int32_t MuteHotkey(int32_t fallback) {
+    return Get().muteHotkey.value_or(fallback);
+}
+
+inline bool SetMuteHotkey(int32_t value) {
+    Mutable().muteHotkey = value;
+    return WriteSetting("audio", "mute_key", std::to_string(value));
 }
 
 inline bool SetAudioVolume(float value) {
@@ -774,6 +896,15 @@ inline bool WidescreenEnabled(bool fallback = false) {
     return Get().widescreen.value_or(fallback);
 }
 
+inline bool ForceAspect169Enabled(bool fallback = false) {
+    return Get().forceAspect169.value_or(fallback);
+}
+
+inline bool SetForceAspect169(bool value) {
+    Mutable().forceAspect169 = value;
+    return WriteSetting("video", "force_16_9", value ? "true" : "false");
+}
+
 inline bool WindowPosition(int32_t& x, int32_t& y) {
     if (!Get().windowPosX || !Get().windowPosY) {
         return false;
@@ -793,6 +924,10 @@ inline uint32_t WindowHeight(uint32_t fallback) {
 
 inline float ResolutionMultiplier(float fallback = 1.0f) {
     return std::max(0.0f, Get().resolutionMultiplier.value_or(fallback));
+}
+
+inline bool MetalFxSpatialUpscaling(bool fallback = false) {
+    return Get().metalFxSpatialUpscaling.value_or(fallback);
 }
 
 inline float AudioVolume(float fallback = 1.0f) {
@@ -824,14 +959,75 @@ inline bool AudioMixWorkerEnabled(bool fallback = true) {
     return Get().audioMixWorker.value_or(fallback);
 }
 
+// Whether background music should duck automatically for other media playback.
 inline bool AttenuateMusicWhenMediaPlays(bool fallback = false) {
     return Get().attenuateMusicWhenMediaPlays.value_or(fallback);
 }
 
+// Bluetooth Wii Remotes / Wii U Pro Controllers. Read once before SDL's joystick
+// subsystem comes up, so a change only takes effect on the next launch.
+inline bool WiiRemotesEnabled(bool fallback = true) {
+    return Get().wiiRemotes.value_or(fallback);
+}
+
+// Persists the Bluetooth Wii Remote driver switch.
+inline bool SetWiiRemotesEnabled(bool value) {
+    Mutable().wiiRemotes = value;
+    return WriteSetting("controller", "wii_remotes", value ? "true" : "false");
+}
+
+// Whether to keep rescanning Bluetooth while no Wii controller is connected.
+inline bool WiiContinuousScanEnabled(bool fallback = false) {
+    return Get().wiiContinuousScan.value_or(fallback);
+}
+
+// Persists the continuous scanning switch.
+inline bool SetWiiContinuousScanEnabled(bool value) {
+    Mutable().wiiContinuousScan = value;
+    return WriteSetting("controller", "wii_continuous_scan", value ? "true" : "false");
+}
+
+// Wii Remote accelerometer zero-point correction (g, SDL sensor frame); all zero
+// when the remote has not been calibrated.
+inline std::array<double, 3> WiiAccelOffset() {
+    const RuntimeUserConfig& config = Get();
+    return {config.wiiAccelOffsetX.value_or(0.0), config.wiiAccelOffsetY.value_or(0.0),
+            config.wiiAccelOffsetZ.value_or(0.0)};
+}
+
+// Whether to write the per-frame accelerometer trace (off unless asked for).
+inline bool WiiAccelTraceEnabled(bool fallback = false) {
+    return Get().wiiAccelTrace.value_or(fallback);
+}
+
+// True while a non-zero correction is stored ("Clear calibration" writes zeros).
+inline bool HasWiiAccelOffset() {
+    const std::array<double, 3> offset = WiiAccelOffset();
+    return offset[0] != 0.0 || offset[1] != 0.0 || offset[2] != 0.0;
+}
+
+// Persists the accelerometer correction measured by the overlay's calibration.
+inline bool SetWiiAccelOffset(const std::array<double, 3>& offset) {
+    Mutable().wiiAccelOffsetX = offset[0];
+    Mutable().wiiAccelOffsetY = offset[1];
+    Mutable().wiiAccelOffsetZ = offset[2];
+    bool ok = true;
+    const char* keys[3] = {"wii_accel_offset_x", "wii_accel_offset_y", "wii_accel_offset_z"};
+    for (size_t i = 0; i < 3; ++i) {
+        // Always a float literal, so a whole-number offset does not come back as a TOML integer.
+        std::ostringstream formatted;
+        formatted << std::fixed << std::setprecision(4) << offset[i];
+        ok = WriteSetting("controller", keys[i], formatted.str()) && ok;
+    }
+    return ok;
+}
+
+// Target frame rate for frame interpolation, or 0 to disable it.
 inline uint32_t FrameInterpolationFps(uint32_t fallback = 0) {
     return Get().frameInterpolationFps.value_or(fallback);
 }
 
+// Whether to skip draws whose graphics pipeline has not finished compiling yet.
 inline bool SkipUnreadyPipelines(bool fallback = true) {
     return Get().skipUnreadyPipelines.value_or(fallback);
 }
@@ -905,6 +1101,14 @@ inline std::string RetroRewindRoot(std::string fallback = "") {
     return Get().retroRewindRoot.value_or(std::move(fallback));
 }
 
+inline bool DiscordPresenceEnabled(bool fallback = true) {
+    return Get().discordPresenceEnabled.value_or(fallback);
+}
+
+inline std::string DiscordClientId(std::string fallback = "1543984562369990706") {
+    return Get().discordClientId.value_or(std::move(fallback));
+}
+
 inline const std::vector<std::string>& OverlayRoots() {
     return Get().overlayRoots;
 }
@@ -960,6 +1164,9 @@ inline void LogLoadedConfig() {
             }
             if (config.networkEnabled) {
                 std::cout << " network_enabled=" << (*config.networkEnabled ? "true" : "false");
+            }
+            if (config.discordPresenceEnabled) {
+                std::cout << " discord_enabled=" << (*config.discordPresenceEnabled ? "true" : "false");
             }
             if (config.nandRoot) {
                 std::cout << " nand_root=" << *config.nandRoot;

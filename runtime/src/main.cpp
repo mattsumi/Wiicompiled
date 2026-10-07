@@ -23,6 +23,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -38,7 +42,17 @@
 #include <dbghelp.h>
 #else
 #include <signal.h>
+#if defined(__x86_64__)
+// Only the x86 POSIX fault path inspects ucontext_t to recover the page-fault
+// write bit. macOS exposes the signal-handler context through sys/ucontext.h;
+// avoid ucontext.h itself because its deprecated user-context APIs require
+// _XOPEN_SOURCE. The arm64 handler does not inspect a host context at all.
+#if defined(__APPLE__)
+#include <sys/ucontext.h>
+#else
 #include <ucontext.h>
+#endif
+#endif
 #include <unistd.h>
 #endif
 
@@ -49,6 +63,8 @@
 #include "system_bridge.h"
 #include "ppc_runtime.h"
 #include "aurora_events.h"
+#include "wii_remote_input.h"
+#include "discord_presence.h"
 #include "fiber_manager.h"
 #include "hle_stubs.h"
 #include "runtime_config.h"
@@ -921,6 +937,7 @@ constexpr DWORD kCppExceptionCodeMsvc = 0xE06D7363;
 // AddressSanitizer uses STATUS_FATAL_APP_EXIT when it detects an error and wants to report it.
 // We must let ASan's handler run so it can print file/line information.
 constexpr DWORD kAsanFatalAppExit = 0x40000015; // STATUS_FATAL_APP_EXIT
+LONG ReportFatalSehAndExit(EXCEPTION_POINTERS* info);
 
 void ReportStructuredException(EXCEPTION_POINTERS* info) {
     if (!info || !info->ExceptionRecord) {
@@ -1022,13 +1039,34 @@ LONG CALLBACK SehLogger(EXCEPTION_POINTERS* info) {
         info->ExceptionRecord->ExceptionCode == kAsanFatalAppExit) { // ASan reporting - let it print first
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    
+    // Software-raised exceptions (customer bit set) are used for internal control flow by
+    // system DLLs (e.g. msxml6 while mscms parses a display colour profile) and are caught
+    // by their own frame handlers. Only hardware faults are fatal at first chance; anything
+    // else that truly goes unhandled reaches UnhandledSehFilter.
+    if ((info->ExceptionRecord->ExceptionCode & 0x20000000u) != 0) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    return ReportFatalSehAndExit(info);
+}
+
+LONG WINAPI UnhandledSehFilter(EXCEPTION_POINTERS* info) {
+    if (info == nullptr || info->ExceptionRecord == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    if (code == kCppExceptionCodeGcc || code == kCppExceptionCodeMsvc || code == kAsanFatalAppExit) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    return ReportFatalSehAndExit(info);
+}
+
+LONG ReportFatalSehAndExit(EXCEPTION_POINTERS* info) {
     // Guard against re-entrancy: if we crash while reporting, don't recurse
     static std::atomic_flag s_inCrashHandler = ATOMIC_FLAG_INIT;
     if (s_inCrashHandler.test_and_set()) {
         std::_Exit(EXIT_FAILURE);
     }
-    
+
     // Report the structured exception with detailed information
     ReportStructuredException(info);
     const auto* record = info->ExceptionRecord;
@@ -1063,6 +1101,7 @@ LONG CALLBACK SehLogger(EXCEPTION_POINTERS* info) {
 void InstallSehLogger() {
     if (!g_vectoredSehHandle) {
         g_vectoredSehHandle = AddVectoredExceptionHandler(1, SehLogger);
+        SetUnhandledExceptionFilter(UnhandledSehFilter);
     }
 }
 #else
@@ -1094,7 +1133,11 @@ void PosixMemoryFaultHandler(int sig, siginfo_t* info, void* ucontextVoid) {
     // error code x86 pushes on a page fault records whether it was a write.
     if (ucontextVoid != nullptr) {
         auto* uc = static_cast<ucontext_t*>(ucontextVoid);
+#if defined(__APPLE__)
+        isWrite = uc->uc_mcontext != nullptr && (uc->uc_mcontext->__es.__err & 0x2) != 0;
+#else
         isWrite = (uc->uc_mcontext.gregs[REG_ERR] & 0x2) != 0;
+#endif
     }
 #endif
 
@@ -1268,6 +1311,7 @@ static void TerminateHandler() {
     std::_Exit(EXIT_FAILURE);
 }
 
+// Runtime entry point: loads the configuration, brings up aurora and runs the game.
 int RuntimeMain(int argc, char** argv) {
     // Must run before the transcript duplicates stdout/stderr: it decides what
     // those descriptors are mirrored to now that the products are GUI-subsystem.
@@ -1292,6 +1336,9 @@ int RuntimeMain(int argc, char** argv) {
             throw std::invalid_argument("The game runtime does not accept command-line options; use Config.toml through the installed host.");
         }
         RuntimeConfigFile::LogLoadedConfig();
+        if (RuntimeConfigFile::DiscordPresenceEnabled()) {
+            DiscordPresence::Initialize(RuntimeConfigFile::DiscordClientId(), "Mario Kart Wii");
+        }
         SystemBridge::Initialize();
         TranslatedFunctionRegistry::Finalize();
 
@@ -1316,7 +1363,8 @@ int RuntimeMain(int argc, char** argv) {
         auroraConfig.logCallback = &RuntimeAuroraLogCallback;
         auroraConfig.logLevel = LOG_DEBUG;
         const bool configWidescreen = RuntimeConfigFile::WidescreenEnabled(true);
-        auroraConfig.windowWidth = configWidescreen ? 854 : 640;
+        const bool forceAspect169 = RuntimeConfigFile::ForceAspect169Enabled();
+        auroraConfig.windowWidth = (configWidescreen || forceAspect169) ? 854 : 640;
         auroraConfig.windowHeight = 480;
         auroraConfig.windowWidth = RuntimeConfigFile::WindowWidth(auroraConfig.windowWidth);
         auroraConfig.windowHeight = RuntimeConfigFile::WindowHeight(auroraConfig.windowHeight);
@@ -1334,7 +1382,8 @@ int RuntimeMain(int argc, char** argv) {
         // No vsync knob: aurora always configures a non-blocking present mode.
         auroraConfig.desiredBackend = BACKEND_AUTO;
         const float resolutionMultiplier = RuntimeConfigFile::ResolutionMultiplier(1.0f);
-        ConfigureMkwDynamicAspect(configWidescreen, auroraConfig.windowWidth, auroraConfig.windowHeight);
+        ConfigureMkwDynamicAspect(configWidescreen, forceAspect169,
+                                  auroraConfig.windowWidth, auroraConfig.windowHeight);
         VISetFrameBufferScale(resolutionMultiplier);
         // One table for both directions. RuntimeConfigFile::IsSupportedGraphicsApi
         // whitelists exactly these config names, so an unrecognised value has
@@ -1343,9 +1392,21 @@ int RuntimeMain(int argc, char** argv) {
             const char* configName;
             AuroraBackend backend;
         };
+#if defined(__APPLE__)
+        static constexpr std::array<GraphicsBackendEntry, 2> kGraphicsBackends{{
+            {"auto", BACKEND_AUTO}, {"metal", BACKEND_METAL},
+        }};
+// only vulkan for linux
+#elif defined(__linux__)
+            static constexpr std::array<GraphicsBackendEntry, 2> kGraphicsBackends{{
+            {"auto", BACKEND_AUTO}, {"vulkan", BACKEND_VULKAN},
+        }};
+#elif defined(_WIN32)
         static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
             {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN},
         }};
+
+#endif
         const auto backendDisplayName = [](AuroraBackend value) -> const char* {
             for (const auto& entry : kGraphicsBackends) {
                 if (entry.backend == value) {
@@ -1364,7 +1425,16 @@ int RuntimeMain(int argc, char** argv) {
         }
         const AuroraBackend requestedBackend = auroraConfig.desiredBackend;
 
+        // SDL only reads its Wii driver hint when the joystick subsystem starts, which
+        // aurora_initialize does; a Bluetooth Wii Remote paired before launch must be
+        // visible on that first scan.
+        WiiRemoteInput::ConfigureSdlHints(RuntimeConfigFile::WiiRemotesEnabled(true));
+
         const AuroraInfo auroraInfo = aurora_initialize(0, nullptr, &auroraConfig);
+        if (auroraInfo.initializationStatus != AURORA_INITIALIZATION_SUCCESS) {
+            throw std::runtime_error(auroraInfo.initializationError != nullptr
+                ? auroraInfo.initializationError : "No supported graphics backend is available");
+        }
         if (requestedBackend != BACKEND_AUTO && auroraInfo.backend != requestedBackend) {
             RT_LOG(RT_TAG_RUNTIME) << "graphics_api=\"" << backend
                       << "\" is not available on this system; aurora fell back to \""
@@ -1380,14 +1450,15 @@ int RuntimeMain(int argc, char** argv) {
                                       auroraInfo.windowSize.native_fb_height);
         settings_overlay::InitializeRuntimeSettings();
         RT_LOG(RT_TAG_CONFIG) << "video.widescreen=" << (configWidescreen ? "true" : "false")
-                  << " SCGetAspectRatio=" << (configWidescreen ? 1 : 0)
+                  << " force_16_9=" << (forceAspect169 ? "true" : "false")
+                  << " SCGetAspectRatio=" << (configWidescreen || forceAspect169 ? 1 : 0)
                   << " resolutionMultiplier=" << resolutionMultiplier
                   << " window=" << auroraInfo.windowSize.width << "x" << auroraInfo.windowSize.height
                   << " native=" << auroraInfo.windowSize.native_fb_width << "x"
                   << auroraInfo.windowSize.native_fb_height
-                  << " viewportPolicy=" << (g_dynamicAspectRatioEnabled ? "stretch" : "fit")
+                  << " viewportPolicy=" << (forceAspect169 ? "16:9" : (configWidescreen ? "stretch" : "fit"))
                   << " presentAspect="
-                  << (g_dynamicAspectRatioEnabled ? "surface (dynamic EGG canvas)" : "4:3")
+                  << (forceAspect169 ? "16:9" : (configWidescreen ? "surface (dynamic EGG canvas)" : "4:3"))
                   << std::endl;
         g_auroraInitialized.store(true, std::memory_order_release);
 
@@ -1418,6 +1489,7 @@ int RuntimeMain(int argc, char** argv) {
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
         aurora_shutdown();
+        DiscordPresence::Shutdown();
         SetRuntimeExitCodeImpl(0);
         ShutdownProcessTranscript();
         return 0;
@@ -1435,6 +1507,7 @@ int RuntimeMain(int argc, char** argv) {
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
         aurora_shutdown();
+        DiscordPresence::Shutdown();
         ShutdownProcessTranscript();
         return 1;
     } catch (const std::exception& ex) {
@@ -1446,6 +1519,7 @@ int RuntimeMain(int argc, char** argv) {
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
         aurora_shutdown();
+        DiscordPresence::Shutdown();
         ShutdownProcessTranscript();
         return 1;
     }

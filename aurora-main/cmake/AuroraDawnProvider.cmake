@@ -48,7 +48,7 @@ if (_aurora_dawn_provider STREQUAL "auto")
     set(_has_package TRUE)
   elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|aarch64)$")
     set(_has_package TRUE)
-  elseif (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|x86_64)$")
+  elseif (APPLE AND (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|x86_64)$" OR CMAKE_OSX_ARCHITECTURES MATCHES "^(arm64|x86_64)$"))
     set(_has_package TRUE)
   endif ()
 
@@ -101,7 +101,7 @@ if (_aurora_dawn_provider STREQUAL "vendor")
     include(FetchContent)
     FetchContent_Declare(dawn
       URL "https://github.com/google/dawn/archive/refs/tags/${AURORA_DAWN_VERSION}.tar.gz"
-      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE
       EXCLUDE_FROM_ALL
     )
     FetchContent_MakeAvailable(dawn)
@@ -143,6 +143,10 @@ elseif (_aurora_dawn_provider STREQUAL "package")
   if (NOT AURORA_DAWN_PACKAGE_URL)
     string(TOLOWER "${CMAKE_SYSTEM_NAME}" _dawn_system)
     string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _dawn_arch)
+    if (APPLE AND CMAKE_OSX_ARCHITECTURES)
+      list(GET CMAKE_OSX_ARCHITECTURES 0 _dawn_osx_arch)
+      string(TOLOWER "${_dawn_osx_arch}" _dawn_arch)
+    endif ()
     if (_dawn_system STREQUAL "windows")
       if (_dawn_arch STREQUAL "x86_64")
         set(_dawn_arch "amd64")
@@ -151,15 +155,36 @@ elseif (_aurora_dawn_provider STREQUAL "package")
       endif ()
     endif ()
     set(AURORA_DAWN_PACKAGE_URL
-      "https://github.com/encounter/dawn-build/releases/download/${AURORA_DAWN_VERSION}/dawn-${_dawn_system}-${_dawn_arch}.tar.gz")
+      "https://github.com/theofficialgman/dawn-build/releases/download/${AURORA_DAWN_VERSION}/dawn-${_dawn_system}-${_dawn_arch}.tar.gz")
 
     # A release asset is mutable: the same tag has already served two different windows-amd64 archives,
     # and a cached extraction is never re-verified. Pin the digest for the combinations we ship.
-    if (NOT AURORA_DAWN_PACKAGE_URL_HASH
-        AND AURORA_DAWN_VERSION STREQUAL "v20260603.191052"
-        AND _dawn_system STREQUAL "windows" AND _dawn_arch STREQUAL "amd64")
-      set(AURORA_DAWN_PACKAGE_URL_HASH
-        "SHA256=7785373d569b3b0237918ec9c523239f7d0667857c5ea8242e3cdfde95e6aeab")
+    if (NOT AURORA_DAWN_PACKAGE_URL_HASH AND AURORA_DAWN_VERSION STREQUAL "v20260603.191052")
+      if (_dawn_system STREQUAL "windows" AND _dawn_arch STREQUAL "amd64")
+        set(AURORA_DAWN_PACKAGE_URL_HASH
+          "SHA256=13be9cff8b9b179c42dcd16aeabb6effcc8f0dfdcc14463eda2a5caeda225142")
+      elseif (_dawn_system STREQUAL "windows" AND _dawn_arch STREQUAL "arm64")
+        set(AURORA_DAWN_PACKAGE_URL_HASH
+          "SHA256=bf2d921110f14a1d6553f673c5597988e66c02af5587e4a1fee167937d247734")
+      elseif (_dawn_system STREQUAL "linux" AND _dawn_arch STREQUAL "x86_64")
+        set(AURORA_DAWN_PACKAGE_URL_HASH
+          "SHA256=7adcf241bb2a24ec0c576609f2d67203e0e65db9c5a286ca2bbb6281fa644b35")
+      elseif (_dawn_system STREQUAL "linux" AND _dawn_arch STREQUAL "aarch64")
+        set(AURORA_DAWN_PACKAGE_URL_HASH
+          "SHA256=2415e253d46f91b2d72fc73bf6055fb31b98b67c773dc546e1991b1cf019732f")
+      elseif (_dawn_system STREQUAL "darwin" AND _dawn_arch STREQUAL "arm64")
+        set(AURORA_DAWN_PACKAGE_URL_HASH
+          "SHA256=0a8ea8eb0159fc0ba1083c52155d9376fb173cffe690b400464a6ad8881bb461")
+      elseif (_dawn_system STREQUAL "darwin" AND _dawn_arch STREQUAL "x86_64")
+        set(AURORA_DAWN_PACKAGE_URL_HASH
+          "SHA256=5fe2c7a2a8b4cb82acee4af16779a83ae333c7657b9dc1a5008f5fd1f5ad5f80")
+      elseif (_dawn_system STREQUAL "ios" AND _dawn_arch STREQUAL "arm64")
+        set(AURORA_DAWN_PACKAGE_URL_HASH
+          "SHA256=f97701d26fd1f25bbcc260b4c31736ede134c730c12556029e2470fde967f424")
+      elseif (_dawn_system STREQUAL "android" AND _dawn_arch STREQUAL "aarch64")
+        set(AURORA_DAWN_PACKAGE_URL_HASH
+          "SHA256=0e63e8cbf53551f703f582d1306f4257c0380353f66b53369d96952ce6d9f934")
+      endif ()
     endif ()
   endif ()
   message(STATUS "aurora: Fetching prebuilt Dawn package from ${AURORA_DAWN_PACKAGE_URL}")
@@ -173,7 +198,7 @@ elseif (_aurora_dawn_provider STREQUAL "package")
   FetchContent_Declare(dawn_prebuilt
     URL "${AURORA_DAWN_PACKAGE_URL}"
     ${_dawn_prebuilt_hash_argument}
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    DOWNLOAD_EXTRACT_TIMESTAMP FALSE
   )
   FetchContent_MakeAvailable(dawn_prebuilt)
 

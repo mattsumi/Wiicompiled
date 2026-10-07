@@ -127,20 +127,50 @@ internal static class Program
         string? retroWfcOfflineDir = null;
         if (downloadPayload)
         {
-            // Reused if a previous install already downloaded and it's still valid - matches
-            // Windows's own reuse-if-valid behavior instead of re-downloading on every install.
             var cacheDir = Path.Combine(workspace, "generated", "retro-wfc-payload");
-            reporter.Progress(InstallStages.Validate, "Preparing the Retro-WFC payload", 1);
+            reporter.Progress(InstallStages.Validate,
+                "Downloading the current Retro-WFC payload", 1);
             try
             {
-                RetroWfcPayload.ValidateStagedRetroWfcPayloadDirectory(cacheDir);
-            }
-            catch (InvalidDataException)
-            {
+                // A valid signature authenticates a payload, but does not prove it is the latest
+                // signed revision. Always ask the fixed endpoint for the current snapshot; the
+                // downloader verifies it before atomically replacing the cache.
                 await RetroWfcPayload.DownloadRetroWfcPayloadAsync(
                     RetroWfcPayload.CurrentRetroWfcPayloadUri, cacheDir, token);
             }
+            catch (Exception downloadFailure) when (!token.IsCancellationRequested &&
+                                                     downloadFailure is HttpRequestException or TimeoutException
+                                                         or IOException)
+            {
+                // Offline installs may continue with a previously authenticated snapshot. Do not
+                // use this path for a newly downloaded payload that failed signature validation:
+                // that must remain a hard failure instead of hiding possible endpoint tampering.
+                try
+                {
+                    RetroWfcPayload.ValidateStagedRetroWfcPayloadDirectory(cacheDir);
+                }
+                catch (Exception cacheFailure) when (cacheFailure is IOException or
+                                                     UnauthorizedAccessException or InvalidDataException)
+                {
+                    throw new InvalidOperationException(
+                        "The current Retro-WFC payload could not be downloaded and no valid cached " +
+                        $"payload is available ({cacheFailure.Message.TrimEnd('.')}).", downloadFailure);
+                }
+
+                reporter.Diagnostic(
+                    "The current Retro-WFC payload could not be downloaded; using the previously " +
+                    $"verified cached payload instead ({downloadFailure.Message.TrimEnd('.')}).");
+            }
             retroWfcOfflineDir = cacheDir;
+        }
+
+        var sysroot = flags.GetValueOrDefault("sysroot");
+        // --sysroot explicitly provided (even as bare flag at end of argv, which ParseArgs
+        // stores as null) must carry a path; omitting --sysroot entirely is fine (local-build.sh
+        // adds -UCMAKE_SYSROOT to clear any stale cached value from a prior configure).
+        if (flags.ContainsKey("sysroot") && string.IsNullOrWhiteSpace(sysroot))
+        {
+            throw new ArgumentException("--sysroot requires a non-empty directory path.");
         }
 
         await BuildRunner.RunAsync(
@@ -150,6 +180,13 @@ internal static class Program
             skipPayload,
             flags.ContainsKey("force-clean-build"),
             flags.GetValueOrDefault("translator-bin"),
+            flags.GetValueOrDefault("cc"),
+            flags.GetValueOrDefault("cxx"),
+            flags.GetValueOrDefault("fuse-ld"),
+            flags.GetValueOrDefault("cmake"),
+            flags.GetValueOrDefault("ninja"),
+            flags.GetValueOrDefault("native-prebuilt-dir"),
+            sysroot,
             reporter, token);
 
         reporter.Progress(InstallStages.Shortcuts, "Creating shortcuts", 98);
@@ -317,7 +354,8 @@ internal static class Program
           install [--game ISO_PATH] [--install-dir DIR] [--retro-dir DIR
                   {--download-retro-wfc-payload | --skip-retro-wfc-payload}]
                   [--force-clean-build] [--translator-bin PATH] [--disc-tool-bin PATH]
-                  [--progress-json] [--workspace DIR]
+                  [--cc PATH] [--cxx PATH] [--fuse-ld NAME_OR_PATH] [--cmake PATH] [--ninja PATH]
+                  [--native-prebuilt-dir DIR] [--sysroot PATH] [--progress-json] [--workspace DIR]
           uninstall
           launch-base
           launch-retro

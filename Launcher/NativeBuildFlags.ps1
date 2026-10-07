@@ -40,41 +40,55 @@ function Get-MkwToolchainPath([string]$ToolchainRoot) {
     ) -join ';')
 }
 
-function Get-MkwShellSafeToolchainRoot([string]$ToolchainRoot) {
-    if ([string]::IsNullOrWhiteSpace($ToolchainRoot)) { throw 'A toolchain root is required.' }
-    $full = [IO.Path]::GetFullPath($ToolchainRoot)
+function Get-MkwBuildSafePath([string]$Path, [string]$Kind, [string]$MarkerFile) {
+    <#
+    The Windows native build passes workspace paths through CMake, Ninja response files and
+    clang, which do not all interpret quotes the same way. Keep those paths plain even when the
+    user's install directory contains an apostrophe, ampersand or other punctuation.
+    #>
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw "A $Kind path is required." }
+    $full = [IO.Path]::GetFullPath($Path)
     # A drive root keeps its separator: "C:" is relative to the current directory on that drive.
     if ($full -ne [IO.Path]::GetPathRoot($full)) { $full = $full.TrimEnd('\') }
-    if ($full -notmatch '[()&^%!]') { return $full }
+    if ($full -cmatch '^[A-Za-z0-9 ._\\:-]+$') { return $full }
+
+    Assert-File (Join-Path $full $MarkerFile) "$Kind marker"
 
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($full.ToLowerInvariant()))
     } finally { $sha.Dispose() }
-    $linkName = 'toolchain-' + ((($bytes[0..7]) | ForEach-Object { $_.ToString('x2') }) -join '')
+    $linkName = "$Kind-" + ((($bytes[0..7]) | ForEach-Object { $_.ToString('x2') }) -join '')
 
     $failures = @()
     foreach ($base in @($env:ProgramData, $env:PUBLIC)) {
-        if ([string]::IsNullOrWhiteSpace($base) -or $base -match '[()&^%! ]') { continue }
+        if ([string]::IsNullOrWhiteSpace($base) -or $base -cnotmatch '^[A-Za-z0-9._\\:-]+$') { continue }
         $link = Join-Path (Join-Path $base 'WiiCompiled') $linkName
         try {
             [IO.Directory]::CreateDirectory((Split-Path -Parent $link)) | Out-Null
-            # The name already identifies the target, so an existing junction that still resolves is
-            # this one; only a broken leftover is replaced. Directory.Delete removes the reparse
-            # point itself, where Remove-Item -Recurse would delete the toolchain it points at.
-            if (-not (Test-Path -LiteralPath (Join-Path $link 'CMake\bin\cmake.exe') -PathType Leaf)) {
-                if (Test-Path -LiteralPath $link) { [IO.Directory]::Delete($link) }
+            $existing = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+            if ($null -ne $existing) {
+                # Never trust a directory just because it has the marker: it could point at a
+                # different installation. Nor may we remove a directory we did not create.
+                if ($existing.LinkType -ne 'Junction' -or
+                    @($existing.Target).Count -ne 1 -or
+                    -not [string]::Equals([IO.Path]::GetFullPath(@($existing.Target)[0]),
+                        $full, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "An existing path is not the expected junction: $link"
+                }
+            } else {
                 New-Item -ItemType Junction -Path $link -Target $full -ErrorAction Stop | Out-Null
             }
-            Write-Host "MKWCBUILD: Building through $link, because $full contains characters cmd.exe cannot parse"
+            Assert-File (Join-Path $link $MarkerFile) "$Kind junction marker"
+            Write-Host "MKWCBUILD: Building the $Kind through $link, because $full contains characters the native build cannot quote reliably"
             return $link
         } catch {
             $failures += "$link ($($_.Exception.Message))"
         }
     }
-    throw ("The toolchain path $full contains a character (one of ( ) & ^ % !) that the compiler " +
-        'cannot be invoked through, and no junction to it could be created: ' + ($failures -join '; ') +
-        '. Install to a path without those characters.')
+    throw ("The $Kind path $full cannot be passed safely to the native build, and no junction " +
+        'to it could be created: ' + ($failures -join '; ') + '. Install to a path of plain ' +
+        'letters, digits and spaces, or make a safe junction location available.')
 }
 
 function Get-MkwProjectPins([string]$ProjectFile) {
@@ -117,12 +131,13 @@ function Get-MkwProjectPins([string]$ProjectFile) {
 }
 
 function Invoke-Checked([string]$FilePath, [string[]]$Arguments, [string]$Description,
-    [string]$LogPrefix = 'MKWCBUILD', [string]$StepId = '') {
+    [string]$LogPrefix = 'MKWCBUILD', [string]$StepId = '', [bool]$WaitForProcessTree = $true) {
     <#
-    Runs a build tool and turns a non-zero exit code into a described failure. Start-Process -Wait
-    is deliberate: it waits for the whole process tree, since a .NET single-file bundle host may
-    hand off to an extracted child that PowerShell's call operator would not wait for. Start-Process
-    doesn't publish $LASTEXITCODE, so this sets it manually for callers that check it.
+    Runs a build tool and turns a non-zero exit code into a described failure. By default,
+    Start-Process -Wait waits for the whole process tree, since a .NET single-file bundle host may
+    hand off to an extracted child that PowerShell's call operator would not wait for. Callers that
+    need to avoid waiting on unrelated descendants can opt into the call-operator path.
+    Start-Process doesn't publish $LASTEXITCODE, so this sets it manually for callers that check it.
     -StepId emits the machine-readable form the installer's progress bar consumes (BuildStepIds in
     WiiCompiled.Setup/InstallProgress.cs); the human sentence stays on the same log line.
     #>
@@ -132,9 +147,14 @@ function Invoke-Checked([string]$FilePath, [string[]]$Arguments, [string]$Descri
         if ($_.Contains('"')) { throw "A native build argument contains an unsupported quote: $_" }
         '"' + $_ + '"'
     })
-    $process = Start-Process -FilePath $FilePath -ArgumentList $quotedArguments `
-        -NoNewWindow -Wait -PassThru
-    $exitCode = $process.ExitCode
+    if ($WaitForProcessTree) {
+        $process = Start-Process -FilePath $FilePath -ArgumentList $quotedArguments `
+            -NoNewWindow -Wait -PassThru
+        $exitCode = $process.ExitCode
+    } else {
+        & $FilePath @Arguments
+        $exitCode = $LASTEXITCODE
+    }
     $global:LASTEXITCODE = $exitCode
     if ($exitCode -ne 0) { throw "$Description failed with exit code $exitCode." }
 }

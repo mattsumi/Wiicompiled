@@ -6,6 +6,7 @@
 #include <imgui.h>
 #include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_joystick.h>
+#include <SDL3/SDL_platform.h>
 
 #include <algorithm>
 #include <array>
@@ -70,7 +71,6 @@ struct WizardState {
     size_t stepIndex = 0;
     std::array<std::optional<std::string>, kSteps.size()> bindings{};
     std::vector<int16_t> axisBaseline;
-    bool baselinePending = true;
     Clock::time_point acceptAfter{};
     std::string status;
 };
@@ -111,8 +111,6 @@ void AdvanceStep(std::optional<std::string> value) {
     g_wizard.bindings[g_wizard.stepIndex] = std::move(value);
     ++g_wizard.stepIndex;
     g_wizard.acceptAfter = Clock::now() + kCaptureDebounce;
-    g_wizard.baselinePending = true;
-    SnapshotAxes();
 }
 
 void StopWizard() {
@@ -144,7 +142,8 @@ void StartWizard(SDL_JoystickID instance) {
     const char* name = SDL_GetJoystickNameForID(instance);
     g_wizard.deviceName = name != nullptr ? name : "Controller";
     g_wizard.acceptAfter = Clock::now() + kCaptureDebounce;
-    g_wizard.baselinePending = true;
+    // Keep the resting positions for the whole wizard. Sampling again after a
+    // press would treat a held control as neutral and could bind its release.
     SnapshotAxes();
 }
 
@@ -157,7 +156,7 @@ std::string BuildMappingString() {
             mapping += std::string(kSteps[i].mappingKey) + ":" + *g_wizard.bindings[i] + ",";
         }
     }
-    mapping += "platform:Windows,";
+    mapping += std::string("platform:") + SDL_GetPlatform() + ",";
     return mapping;
 }
 
@@ -196,6 +195,8 @@ void FinishWizard() {
                               << std::endl;
         return;
     }
+    // The SDL remapped event may arrive next frame; discard cached pedal bindings now.
+    wheel_ffb::NotifyControllersChanged();
     if (!PersistMapping(guid, mapping)) {
         g_wizard.status =
             "Failed to save mapping to " + RuntimeConfigFile::PathToUtf8(MappingDbPath());
@@ -211,11 +212,13 @@ struct SetupCandidate {
     SDL_JoystickID id;
     std::string name;
     bool incompleteMapping;
+    bool wheelLayout = false;
 };
 
 // A device needs setup when SDL has no gamepad mapping for it at all, or when
-// the mapping it matched has no analog stick even though the hardware reports
-// axes (SDL's built-in raphnet WUSBMote entry is button-only).
+// the mapping it matched lacks the required stick axes even though the hardware
+// reports them (SDL's built-in raphnet WUSBMote entry is button-only). Wheels only
+// need a steering axis; all of their layouts remain available to customize.
 std::vector<SetupCandidate> CollectCandidates() {
     std::vector<SetupCandidate> candidates;
     int count = 0;
@@ -231,23 +234,24 @@ std::vector<SetupCandidate> CollectCandidates() {
             candidates.push_back({id, name, false});
             continue;
         }
-        if (std::find(g_builtinMappedGuids.begin(), g_builtinMappedGuids.end(), GuidString(id)) !=
-            g_builtinMappedGuids.end()) {
-            candidates.push_back({id, name, false});
-            continue;
-        }
-        SDL_Gamepad* gamepad = SDL_GetGamepadFromID(id);
-        if (gamepad == nullptr) {
-            continue;
-        }
+        const bool isWheel = wheel_ffb::IsWheelInstance(id);
         char* mapping = SDL_GetGamepadMappingForID(id);
         if (mapping == nullptr) {
+            if (isWheel) {
+                candidates.push_back({id, name, true});
+            }
             continue;
         }
         const std::string mappingStr = mapping;
         SDL_free(mapping);
-        const bool hasStick = mappingStr.find("leftx:") != std::string::npos;
-        SDL_Joystick* joystick = SDL_GetGamepadJoystick(gamepad);
+        const bool hasStick = mappingStr.find("leftx:") != std::string::npos &&
+                              (isWheel || mappingStr.find("lefty:") != std::string::npos);
+        if (isWheel) {
+            candidates.push_back({id, name, !hasStick, hasStick});
+            continue;
+        }
+        SDL_Gamepad* gamepad = SDL_GetGamepadFromID(id);
+        SDL_Joystick* joystick = gamepad != nullptr ? SDL_GetGamepadJoystick(gamepad) : nullptr;
         if (!hasStick && joystick != nullptr && SDL_GetNumJoystickAxes(joystick) >= 2) {
             candidates.push_back({id, name, true});
         }
@@ -415,11 +419,6 @@ void HandleSdlEvent(const SDL_Event& event) {
     if (Clock::now() < g_wizard.acceptAfter) {
         return;
     }
-    if (g_wizard.baselinePending) {
-        g_wizard.baselinePending = false;
-        SnapshotAxes();
-        return;
-    }
     switch (event.type) {
     case SDL_EVENT_JOYSTICK_BUTTON_DOWN:
         if (event.jbutton.which == g_wizard.instance) {
@@ -446,21 +445,29 @@ void DrawSetupList() {
     if (candidates.empty()) {
         return;
     }
-    ImGui::SeparatorText("Unrecognized controllers");
+    ImGui::SeparatorText("Controller setup");
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 380.0f);
     ImGui::TextDisabled(
-        "These devices have no usable gamepad mapping. Set one up by pressing "
-        "each control when asked.");
+        "Configure devices without a usable mapping, or customize a wheel layout "
+        "by pressing each control when asked. Center sticks and steering, and release "
+        "buttons and pedals before starting.");
     ImGui::PopTextWrapPos();
     for (const auto& candidate : candidates) {
         ImGui::PushID(static_cast<int>(candidate.id));
         ImGui::TextUnformatted(candidate.name.c_str());
         ImGui::SameLine();
-        if (ImGui::SmallButton(candidate.incompleteMapping ? "Fix mapping" : "Set up")) {
+        const char* action = candidate.wheelLayout          ? "Customize"
+                             : candidate.incompleteMapping ? "Fix mapping"
+                                                           : "Set up";
+        if (ImGui::SmallButton(action)) {
             StartWizard(candidate.id);
         }
-        if (candidate.incompleteMapping && ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("SDL matched a mapping without an analog stick for this device");
+        if (ImGui::IsItemHovered()) {
+            if (candidate.wheelLayout) {
+                ImGui::SetTooltip("This wheel has a layout that you can customize");
+            } else if (candidate.incompleteMapping) {
+                ImGui::SetTooltip("SDL matched a mapping without all required stick axes");
+            }
         }
         ImGui::PopID();
     }
@@ -499,7 +506,6 @@ void Draw() {
                 g_wizard.bindings[g_wizard.stepIndex].reset();
                 g_wizard.status.clear();
                 g_wizard.acceptAfter = Clock::now() + kCaptureDebounce;
-                SnapshotAxes();
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
@@ -526,7 +532,6 @@ void Draw() {
                 --g_wizard.stepIndex;
                 g_wizard.bindings[g_wizard.stepIndex].reset();
                 g_wizard.acceptAfter = Clock::now() + kCaptureDebounce;
-                SnapshotAxes();
             }
             ImGui::SameLine();
             if (ImGui::Button("Cancel")) {

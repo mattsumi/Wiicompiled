@@ -1,5 +1,18 @@
+<img width="4190" height="1232" alt="wiicomplogofinalfinalfinalev2MADEBY_INKWRECK_plzcredit" src="https://github.com/user-attachments/assets/df7a3f2e-5336-479a-b4c0-968dd578726d" />
 
 # WiiCompiled
+
+<p align="center">
+  <a href="https://github.com/patchzyy/Wiicompiled/releases"><img alt="Windows 10 / 11, x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20%C2%B7%20x64-0078D4"></a>
+  <a href="https://github.com/patchzyy/Wiicompiled/releases"><img alt="Linux, x64 / ARM64" src="https://img.shields.io/badge/Linux-x64%20%2F%20ARM64-FCC624?logo=linux&amp;logoColor=white"></a>
+  <a href="https://github.com/patchzyy/Wiicompiled/releases"><img alt="macOS 14+, Apple Silicon" src="https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Apple%20Silicon-0A84FF?logo=apple&amp;logoColor=white"></a>
+</p>
+<p align="center">
+  <a href="#building-from-source"><img alt="PowerPC static recompilation" src="https://img.shields.io/badge/PowerPC-static%20recompilation-FF9F0A"></a>
+  <a href="#retro-rewind"><img alt="Retro Rewind supported" src="https://img.shields.io/badge/Retro%20Rewind-supported-FF375F"></a>
+  <a href="https://github.com/TeamWheelWizard/WheelWizard/releases"><img alt="Install with Wheel Wizard" src="https://img.shields.io/badge/install%20with-Wheel%20Wizard-8B5CF6"></a>
+  <a href="LICENSE"><img alt="License: GPLv3" src="https://img.shields.io/badge/license-GPLv3-2EA44F?logo=gnu&amp;logoColor=white"></a>
+</p>
 
 A native PC port of Mario Kart Wii, made with static recompilation.
 
@@ -39,47 +52,74 @@ Play at several times the console's resolution.
 **Music ducking.** 
 Start playing something else, Spotify, a YouTube video, and
 the game automatically mutes its own music until the other audio stops. Optional, if you'd
-rather it didn't. All audio that shows in your display media controls on your windows pc fall under this.
+rather it didn't. Windows uses system media controls and Linux uses MPRIS players.
+On macOS 14.2 or later, this detects other apps with active audio output and excludes
+the game's own audio. Apps that keep an output stream running silently can keep
+game music muted even when nothing is audible.
 
 **An in-game settings bar.** 
 Press **F10** while the game window has focus:
 - Internal resolution
 - FPS counter
+- MetalFX spatial upscaling on supported macOS GPUs
 - Controller assignment for all four ports
-- Full per-controller button mapping
+- Full per-controller button mapping, including the bumpers
+- Dolphin-syntax input expressions and GCPadNew.ini import
+- Controller vibration on/off
 - Volume, instant mute, and the music ducking toggle
 
 Everything you change is saved to `Config.toml` on the spot and restored next launch.
 
-**Real controller support.** 
-Controllers are fed to the game as a GameCube controller.
-The port does NOT pretend to be a Wii Remote or Classic Controller.
-Mappings are positional (`south`, `east`, `west`, `north`) rather than Xbox-labelled, so the
-same config makes sense on Xbox, PlayStation, Nintendo and generic SDL pads alike, and extra
-inputs like paddles, touchpads and share buttons show up when the hardware reports them.
+**Dolphin-compatible input expressions.** 
+Each GameCube control can carry an expression in Dolphin's input syntax, with the same operators
+and the same functions.
+A Dolphin `GCPadNew.ini` can be imported directly from the F10 bar.
+
+**Vibration toggle.** 
+Force feedback can be turned off for every port at once.
 The official Wii U / Switch GameCube adapter (WUP-028) works too; as with Dolphin, on Windows the
 adapter must be switched to the WinUSB driver once (Zadig).
 
-**Racing wheels.** 
-Any wheel SDL knows is treated as a wheel: the Logitech Driving Force line, Thrustmaster, Fanatec,
-Moza, Simagic, Simucube, Asetek, Cammus, PXN and others. That gets you force feedback, steering that
-uses the whole rotation of the wheel, and pedals on A and B. Pedal axes are worked out at runtime by
-watching which ones sit at rest and which travel, so a wheel does not need to be in any list here to
-work, and wheels that put both pedals on one axis are handled too.
+**Racing wheels.**
+Wheels identified by SDL, plus recognized Logitech wheel models, can use wheel steering and pedals
+on A and B. A usable SDL gamepad mapping is required: supported Logitech Driving Force models get a
+built-in layout, while other devices may need **Set up** in **F10**, **Controller settings** first.
+A mapping you capture in the wizard overrides the built-in layout. Built-in wheel layouts remain
+available there for customization.
 
-Logitech Driving Force wheels also get a full button layout without any setup, since their layout is
-known. Other wheels play immediately but their buttons come from the **Set up** wizard under
-*Unrecognized controllers* in **F10**, **Controller settings**; a mapping you capture there wins
-over anything built in. If the pedals come out the wrong way round, which happens because no two
-brands agree on axis order, set Accelerator and Brake in that same menu instead of running the
-wizard.
+The pedal heuristic assumes steering on raw axis 0 and pedals resting high. Two-axis devices use a
+combined pedal axis when both pedal selectors are automatic. If that does not match your device,
+choose Accelerator and Brake explicitly, including axis 0; explicit choices override the combined
+axis heuristic. When either A or B is mapped to an SDL axis, including by the wizard, the SDL layout
+owns both pedal controls and the raw selectors are disabled. Use **Customize** to map both pedals.
+These controls and steering sensitivity work with force feedback disabled.
 
-Force feedback is a centering spring that loads up as you steer, plus vibration from the game's own
-rumble. The same menu has sliders for steering sensitivity, strength, spring and vibration; they
-apply as you drag and are saved to `Config.toml`. Set the wheel's rotation range in the wheel's own
-driver, around 270 degrees suits a kart game better than the usual 900. The G29 is what this was
-built and tested against. The G920 and G923 have force feedback problems in SDL itself, and a wheel
-SDL does not recognize at all can be forced with `force_wheel = true` under `[ffb]`.
+Force feedback uses a centering spring and vibration from the game's rumble, where the driver
+supports them. Set the wheel's physical rotation range in its driver. Steering sensitivity is a gain:
+100% uses the available steering travel, while the default 350% reaches maximum game steering at
+roughly 30% of travel from center. Higher sensitivity reaches the limit sooner; it does not change
+the driver's rotation range. Strength, spring, vibration and sensitivity are adjustable in F10 and
+saved to Config.toml.
+
+For a mapped device SDL does not classify as a wheel, select its port and enable **Treat this device
+as a racing wheel**. The override is scoped to that device's SDL GUID. Existing configurations with
+only force_wheel = true must select the device again; an unscoped flag no longer affects every pad.
+Force feedback is opened only through SDL's joystick association or an unambiguous exact-name
+match. Drivers exposing unrelated interface names may therefore provide input without force feedback.
+
+**Real Wii Remotes over Bluetooth.**
+Pair a Wii Remote with Windows (Settings > Bluetooth > Add device, press 1+2 or SYNC, leave the
+PIN empty)
+
+Known limitations of the Wii Remote path:
+- No IR pointer yet: menus are navigated with the D-pad and A (the game treats the remote as
+  pointing away from the screen).
+- Battery level is not reported to the game and the remote's speaker is not implemented.
+- Only the Wii Remote's own accelerometer is calibrated; the Nunchuk's uses SDL's fixed zero point.
+- The Classic Controller's L/R triggers reach the game as digital (full pull on click): SDL does not
+  expose their analog travel.
+- Turn the Wii Remote support off in that menu if you use a Mayflash DolphinBar, which already
+  presents the remote as a regular gamepad.
 
 ## Requirements
 
@@ -87,6 +127,8 @@ SDL does not recognize at all can be forced with `force_wheel = true` under `[ff
 - GPU: GTX 1650 / RX 6400 / Arc A310 or higher
 - CPU: Intel Core i5-8400 / AMD Ryzen 5 2600 (4c/6c, ~3.5GHz+) or higher
 - About 20 GB of free disk space during installation (Final game size ~5 GB)
+- macOS 12 (Monterey) or later on Apple Silicon (`arm64`) or Intel (`x86_64-v3`); pre-Haswell Intel CPUs are unsupported
+- On macOS, a Metal-capable GPU and Apple Xcode Command Line Tools (Setup opens Apple's installer when they are missing)
 - A clean, unmodified **PAL `RMCP01`** disc image of Mario Kart Wii, dumped by you. ISO, GCM,
   GCZ, CISO, WBFS, WIA and RVZ are accepted.
 
@@ -106,6 +148,22 @@ For an easy experience, use [Wheel Wizard](https://github.com/TeamWheelWizard/Wh
 image under Settings, turn on **WiiCompiled (beta)**, and hit install from the Home page.
 Wheel Wizard downloads the setup tool from this repo and walks you through install, updates and
 launching. The backend itself is deliberately command-line only, Wheel Wizard is a wrapper around it.
+
+### macOS
+
+Download `WiiCompiled-Setup.pkg` from this repository's Releases page and open it. The universal
+package selects the appropriate bundled tools for the host architecture, supporting both Apple Silicon (`arm64`)
+and Intel (`x86_64`) Macs. It installs **WiiCompiled Setup** in Applications; open that app, choose
+your clean PAL `RMCP01` disc image, and select either the base game or Retro Rewind. For Retro Rewind, choose the `RetroRewind6` folder
+or its parent folder.
+
+Setup verifies and extracts the image locally, then translates and compiles the native app on your
+Mac. On a first run it may ask macOS to install Xcode Command Line Tools; complete Apple's installer,
+then open Setup again. When the build completes, Setup asks for administrator approval once to install
+`WiiCompiled.app` (and, if selected, `RetroRewind.app`) in `/Applications`.
+
+Setup opens Terminal while it works, so the extraction and build progress—and any error that needs
+reporting—remain visible.
 
 > [!CAUTION]
 > Only take builds from this repository's
@@ -145,7 +203,9 @@ The default test suite needs no binaries and no host C++ compiler, so you can ha
 translator without any game data around.
 
 For everything beyond that, feeding in your own `main.dol`/`StaticR.rel`, running the
-translation, generating the manifest and build graph, and compiling. see [`translator/README.md`](translator/README.md).
+translation, generating the manifest and build graph, and compiling, see [`translator/README.md`](translator/README.md).
+
+For a step-by-step guide on compiling both WiiCompiled and Retro Rewind from source on macOS (Apple Silicon), see the [macOS Build Guide](docs/building-macos.md).
 
 ## FAQ
 
@@ -194,7 +254,7 @@ AI coding tools were used during development of this project.
 All translated output is verified against real hardware behavior and most importantly, physics accuracy is proven synced across Wii, Dolphin, and WiiCompiled (see FAQ). 
 
 ## Credits
-
+- **inkwreck** - making the logo
 - **[aurora](https://github.com/encounter/aurora)** - the GX rendering/windowing backend this
   project's whole graphics layer sits on. MIT licensed.
 - **[Dawn](https://dawn.googlesource.com/dawn)** - Google's WebGPU implementation, powering

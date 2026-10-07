@@ -42,6 +42,28 @@ endfunction()
 mkw_np_resolve(_mkw_np_includes ${MKW_NP_INCLUDE_DIRECTORIES})
 mkw_np_resolve(_mkw_np_links ${MKW_NP_LINK_LIBRARIES})
 mkw_np_resolve(_mkw_np_dawn_config ${MKW_NP_DAWN_CONFIG_DIR})
+if(NOT MKW_PLATFORM_WINDOWS)
+    if(NOT MKW_NP_MBEDTLS_LIBRARIES OR NOT MKW_NP_MBEDTLS_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "The Linux native prebuilt package has no Mbed TLS archives; regenerate it with Prepare-NativePrebuilt.sh")
+    endif()
+    file(SHA256 "${CMAKE_CURRENT_LIST_DIR}/MbedTLSPin.cmake" _mkw_np_current_mbedtls_fingerprint)
+    if(NOT MKW_NP_MBEDTLS_FINGERPRINT STREQUAL _mkw_np_current_mbedtls_fingerprint)
+        message(FATAL_ERROR "The native prebuilt Mbed TLS version differs from this workspace; regenerate the package")
+    endif()
+    mkw_np_resolve(_mkw_np_mbedtls_links ${MKW_NP_MBEDTLS_LIBRARIES})
+    mkw_np_resolve(_mkw_np_mbedtls_include ${MKW_NP_MBEDTLS_INCLUDE_DIR})
+    foreach(_archive IN LISTS _mkw_np_mbedtls_links)
+        if(NOT EXISTS "${_archive}")
+            message(FATAL_ERROR "The native prebuilt package is missing Mbed TLS archive: ${_archive}")
+        endif()
+    endforeach()
+    if(NOT IS_DIRECTORY "${_mkw_np_mbedtls_include}")
+        message(FATAL_ERROR "The native prebuilt package is missing Mbed TLS headers: ${_mkw_np_mbedtls_include}")
+    endif()
+    target_include_directories(mkw_mbedtls SYSTEM INTERFACE "${_mkw_np_mbedtls_include}")
+    target_link_libraries(mkw_mbedtls INTERFACE ${_mkw_np_mbedtls_links})
+endif()
 
 foreach(_dir IN LISTS _mkw_np_includes)
     if(NOT IS_DIRECTORY "${_dir}")
@@ -50,6 +72,16 @@ foreach(_dir IN LISTS _mkw_np_includes)
             "does not have: ${_dir}")
     endif()
 endforeach()
+
+# Dawn's own packaged config (DawnTargets.cmake) links dawn::webgpu_dawn against
+# Threads::Threads directly. A from-source aurora build resolves that as a side effect of
+# add_subdirectory(aurora-main) pulling in Dawn's own CMakeLists.txt; this mode never runs that
+# subdirectory at all, so nothing else would ever define it (verified directly: configuring without
+# this fails with "The link interface of target dawn::webgpu_dawn contains: Threads::Threads but
+# the target was not found"). find_package(Threads) is one of CMake's most basic finder modules and
+# is a no-op on Windows (its threading support is already part of the CRT), so this is safe on
+# every platform this package format targets, not just the one that first hit the failure.
+find_package(Threads REQUIRED)
 
 # Dawn is a prebuilt package on both sides; resolve the same install tree the
 # package was built against so its imported target (and therefore
